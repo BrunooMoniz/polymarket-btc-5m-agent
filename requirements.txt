@@ -1,0 +1,6 @@
+httpx[http2,socks]>=0.28
+websockets>=15
+python-dotenv>=1.1
+typesafe-sdk>=0.6
+py_clob_client_v2>=1.1   # só para EXECUTION_MODE=live
+pytest>=8                # testes

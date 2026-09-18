@@ -1,0 +1,222 @@
+"""Vigia de carteira, shadows e relatório de calibração (offline)."""
+import json
+import threading
+from pathlib import Path
+
+import pytest
+
+from src import calibration
+from src.config import Settings, shadow_env, shadow_names
+from src.ledger import Ledger
+from src.notify import Notifier
+from src.shadow import CachedPM, SharedJevGate
+from src.wallet_watch import WalletWatch
+from tests.test_engine import Clock
+from tests.test_evolucao import Spy
+
+T0 = 1789700400
+
+
+def make_watch(tmp_path, clock, wallet):
+    ledger = Ledger(tmp_path / "ledger.sqlite", tmp_path / "journal.jsonl")
+    spy = Spy()
+    w = WalletWatch(
+        "0xabc", ledger, spy, tmp_path / "ref.json", divergence_usd=1.0, min_order_usd=2.5, clock=clock,
+        collateral_fn=lambda: wallet["collateral"], positions_fn=lambda: wallet["positions"],
+    )
+    return w, ledger, spy
+
+
+def settle(ledger, ts, pnl, cost=5.0):
+    ledger.upsert(ts, status="settled", side="Up", outcome="Up", pnl_usd=pnl, cost_usd=cost, filled_shares=10, fill_price=cost / 10)
+    ledger._conn.execute("UPDATE windows SET updated_at = 0 WHERE ts = ?", (ts,))
+    ledger._conn.commit()
+
+
+def test_wallet_redeem_and_consistent_pnl_do_not_alert(tmp_path):
+    clock, wallet = Clock(T0), {"collateral": 20.0, "positions": []}
+    w, ledger, spy = make_watch(tmp_path, clock, wallet)
+    assert w.check() == "baseline"
+    # ganho de 5 ainda não resgatado: colateral caiu o custo, a posição vale 10
+    settle(ledger, T0, pnl=+5.0)
+    wallet.update(collateral=15.0, positions=[{"slug": "btc-updown-5m-1", "currentValue": 10.0, "redeemable": True}])
+    assert w.check() == "ok"
+    wallet.update(collateral=25.0, positions=[])                     # resgate: muda de bolso, não de valor
+    assert w.check() == "ok"
+    assert spy.sent == []
+
+
+def test_wallet_divergence_needs_two_readings_then_rebases(tmp_path):
+    clock, wallet = Clock(T0), {"collateral": 20.0, "positions": []}
+    w, ledger, spy = make_watch(tmp_path, clock, wallet)
+    w.check()
+    wallet["collateral"] = 14.0                                       # US$ 6 sumiram sem o ledger saber
+    assert w.check() == "pending" and spy.sent == []
+    assert w.check() == "divergence"
+    assert spy.keys() == ["wallet_divergence"] and "-6.00" in spy.sent[0][1]
+    assert w.check() == "ok"                                          # rebaseou: não repete o mesmo alerta
+    assert any(json.loads(l)["event"] == "wallet_divergence" for l in ledger.journal_path.read_text().splitlines())
+
+
+def test_wallet_skips_comparison_while_position_is_open(tmp_path):
+    clock, wallet = Clock(T0), {"collateral": 20.0, "positions": []}
+    w, ledger, spy = make_watch(tmp_path, clock, wallet)
+    w.check()
+    ledger.upsert(T0, status="filled", filled_shares=10, fill_price=0.5, cost_usd=5.0)
+    wallet["collateral"] = 15.0
+    assert w.check() == "busy" and spy.sent == []
+
+
+def test_wallet_alerts_winnings_locked_until_redeem(tmp_path):
+    """O que parou o motor por 6 h em 18/09: saldo livre zerado com ganho esperando resgate."""
+    clock = Clock(T0)
+    wallet = {"collateral": 0.0, "positions": [{"slug": "btc-updown-5m-1", "currentValue": 9.5, "redeemable": True},
+                                               {"slug": "btc-updown-5m-2", "currentValue": 0.0, "redeemable": True}]}
+    w, ledger, spy = make_watch(tmp_path, clock, wallet)
+    w.check()
+    assert spy.keys() == ["wallet_locked"] and "9.50" in spy.sent[0][1]
+    wallet["positions"] = []
+    w2, _, spy2 = make_watch(tmp_path / "b", clock, wallet)
+    w2.check()
+    assert spy2.keys() == ["wallet_empty"]
+
+
+def test_wallet_source_failure_is_not_a_divergence(tmp_path):
+    clock, wallet = Clock(T0), {"collateral": None, "positions": []}
+    w, _, spy = make_watch(tmp_path, clock, wallet)
+    assert w.check() == "unavailable" and spy.sent == [] and not (tmp_path / "ref.json").exists()
+
+
+# ------------------------------------------------------------------ shadows
+def test_shadow_env_is_always_paper_without_wallet_key_and_in_own_dir():
+    env = {"EXECUTION_MODE": "live", "POLYMARKET_PRIVATE_KEY": "segredo", "DATA_DIR": "data-live", "MIN_NET_EDGE": "0.04",
+           "SHADOW_PROFILES": "control, alt", "SHADOW_ALT_FAVORED_SIDE_ONLY": "0", "SHADOW_ALT_EXECUTION_MODE": "live"}
+    assert shadow_names(env) == ["control", "alt"]
+    alt = Settings.from_env(shadow_env(env, "alt"))
+    ctl = Settings.from_env(shadow_env(env, "control"))
+    assert alt.execution_mode == "paper" and alt.polymarket_private_key is None       # nem pedindo vira live
+    assert alt.favored_side_only is False and ctl.favored_side_only is True
+    assert alt.min_net_edge == ctl.min_net_edge == 0.04
+    assert {str(alt.data_dir), str(ctl.data_dir)} == {"data-shadow-alt", "data-shadow-control"}
+
+
+def test_shared_jev_gate_reuses_verdict_inside_window_only():
+    clock, calls = Clock(0), []
+
+    class Gate:
+        def evaluate(self, state):
+            calls.append(state["market"]["window_start_utc"])
+            return object()
+
+    shared = SharedJevGate(Gate(), share_s=8, clock=clock)
+    st = {"market": {"window_start_utc": "10:00:00"}}
+    a = shared.evaluate(st)
+    clock.now += 5
+    assert shared.evaluate(st) is a and len(calls) == 1
+    clock.now += 5
+    assert shared.evaluate(st) is not a and len(calls) == 2           # venceu
+    assert shared.evaluate({"market": {"window_start_utc": "10:05:00"}}) is not a and len(calls) == 3
+
+
+def test_cached_pm_shares_books_and_passes_the_rest_through():
+    clock = Clock(0)
+
+    class PM:
+        n = 0
+
+        def book(self, token):
+            PM.n += 1
+            return f"book-{token}-{PM.n}"
+
+        def market(self, ts):
+            return f"m{ts}"
+
+    c = CachedPM(PM(), book_ttl_s=1.5, clock=clock)
+    assert c.book("a") == c.book("a") == "book-a-1" and c.book("b") == "book-b-2"
+    clock.now += 2
+    assert c.book("a") == "book-a-3" and c.market(7) == "m7"
+
+
+# ------------------------------------------------------------------ calibração
+def _journal(path: Path, events):
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+def test_calibration_report_sections(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.sqlite", tmp_path / "journal.jsonl")
+    events = []
+    for i in range(12):
+        ts = T0 + i * 300
+        up = i % 3 != 0
+        ledger.upsert(ts, status="skipped", outcome="Up" if up else "Down", strike=76000.0, close_price=76000.0 * (1.001 if up else 0.999))
+        p = 0.7 if up else 0.3
+        base = dict(ts=ts, p_raw=p, up_bid=0.49, up_ask=0.51, cand_side="Up" if up else "Down", cand_edge_taker=0.05)
+        events.append(dict(event="eval", phase=60, **base))
+        events.append(dict(event="decision", phase=200, p_adj=p, side="Up" if up else "Down", limit=0.5, vetoed=None if i % 2 else "Jev dá 0.30 para Up (< 0.45)",
+                           jev={"regime_probs": {"0": 0.1, "1": 0.2, "2": 0.7}, "direction_p_up": p}, **base))
+    events += [dict(event="order_posted", t=10.0, order_id="a", post_ms=1800), dict(event="fill", t=14.0, order_id="a"),
+               dict(event="order_posted", t=20.0, order_id="b", post_ms=900), dict(event="cancel_ttl", order_id="b"),
+               dict(event="order_error", error="... order crosses book ...")]
+    ledger.upsert(T0 + 9000, status="settled", side="Up", outcome="Down", pnl_usd=-5.0, cost_usd=5.0, filled_shares=10, fill_price=0.5)
+    events += [dict(event="mark", ts=T0 + 9000, p_side=0.6, bid=0.55), dict(event="mark", ts=T0 + 9000, p_side=0.2, bid=0.30)]
+    _journal(tmp_path / "journal.jsonl", events)
+
+    shadow = tmp_path / "data-shadow-alt"
+    sl = Ledger(shadow / "ledger.sqlite", shadow / "journal.jsonl")
+    sl.upsert(T0, status="settled", pnl_usd=2.0, cost_usd=4.0, outcome="Up", side="Up")
+
+    text = calibration.render(tmp_path, {"alt": shadow})
+    assert "modelo melhor que o mercado" in text                      # p=0,7/0,3 certeiro contra mid 0,50
+    assert "[0.2,0.4)" in text and "[0.6,0.8)" in text and "100%" in text and "0.090" in text
+    assert " 30-89 " in text and "150-209" not in text   # só amostras regulares (eval); decision daria peso dobrado
+    assert "tendência" in text and "chop" not in text.split("Por regime")[1].split("Efeito")[0]
+    assert "liberadas" in text and "vetadas pelo Jev" in text
+    assert "postadas 2 | fills 1 (50%)" in text and "cruzar o book 1" in text and "mediana 1350 ms" in text and "4.0 s" in text
+    assert "Taker hipotético" in text and "σ realizada (n=12" in text
+    # saída antecipada: 10 shares vendidas a 0,30 com taxa = 2,853 − custo 5 = −2,15 contra −5,00 segurando
+    assert "gatilho em 1" in text and "segurando -5.00" in text and "saindo -2.15" in text
+    assert "alt" in text and "+2.00" in text and "Abaixo de ~100" in text
+
+
+def test_calibration_reads_ledger_without_writing(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.sqlite", tmp_path / "journal.jsonl")
+    ledger.upsert(T0, status="seen")
+    before = (tmp_path / "ledger.sqlite").stat().st_mtime_ns
+    calibration.render(tmp_path)
+    assert (tmp_path / "ledger.sqlite").stat().st_mtime_ns == before
+    assert "Janelas com resultado conhecido: 0 de 1" in calibration.render(tmp_path)
+
+
+def test_notifier_mono_block_is_escaped_and_bounded():
+    sent = []
+    n = Notifier("T", "C", post=lambda url, payload: sent.append(payload), start=False)
+    n.send("k", "título <b>", 0, mono="p < 0.35 & x\n" * 600)
+    n.drain_once()
+    body = sent[0]["text"]
+    assert sent[0]["parse_mode"] == "HTML" and body.startswith("título &lt;b&gt;\n<pre>p &lt; 0.35 &amp; x")
+    assert body.endswith("</pre>") and len(body) < 4096
+
+
+def test_shared_jev_gate_shares_a_failure_instead_of_queueing_timeouts():
+    clock, calls = Clock(0), []
+
+    class Down:
+        def evaluate(self, state):
+            calls.append(1)
+            raise TimeoutError("jev fora")
+
+    shared = SharedJevGate(Down(), share_s=8, clock=clock)
+    st = {"market": {"window_start_utc": "10:00:00"}}
+    with pytest.raises(TimeoutError):
+        shared.evaluate(st)                                   # quem provocou a falha vê a original
+    errs = []
+    for _ in range(3):
+        with pytest.raises(Exception) as ei:                  # instância nova a cada vez: traceback não acumula
+            shared.evaluate(st)
+        errs.append(ei.value)
+    assert len(calls) == 1 and all("jev fora" in str(e) for e in errs)
+    assert len({id(e) for e in errs}) == 3
+    clock.now += 9
+    with pytest.raises(TimeoutError):
+        shared.evaluate(st)
+    assert len(calls) == 2
