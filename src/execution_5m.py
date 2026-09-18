@@ -152,54 +152,62 @@ class PaperBroker:
 
 
 class LiveBroker:
-    def __init__(self, private_key: str, proxy_wallet: Optional[str], chain_id: int = 137, client: Any = None, socks_proxy: Optional[str] = None):
+    """Cliente do CLOB construído sob demanda: derivar a credencial exige rede, e no arranque a rota
+    pode estar fora. Estourar ali punha o serviço em laço de reinício (medido em 18/09/2026, com a
+    saída Tor na Alemanha); agora o motor sobe fechado e o cliente nasce na primeira ordem."""
+
+    def __init__(self, private_key: str, proxy_wallet: Optional[str], chain_id: int = 137, client: Any = None,
+                 socks_proxy: Optional[str] = None):
         self.mode = "live"
         self.proxy_wallet = proxy_wallet
         self.socks_proxy = socks_proxy
         self._retired: Any = None
         self._sig_type = 3 if proxy_wallet else 0
-        if client is not None:  # injeção para testes
-            self._client = client
-            return
-        from py_clob_client_v2.client import ClobClient
-
-        if socks_proxy:
-            # Rota so o trafego do CLOB (market data segue direto). O cliente usa um
-            # httpx.Client de nivel de modulo; trocamos por um com proxy antes de usar.
-            import httpx
-
-            import py_clob_client_v2.http_helpers.helpers as _hh
-
-            _hh._http_client = httpx.Client(http2=True, proxy=socks_proxy, timeout=12.0)
-
-        if not private_key:
+        self._private_key = private_key
+        self._chain_id = chain_id
+        self._client = client          # injeção nos testes: pronto, sem rede
+        self._proxy_applied = client is not None
+        if client is None and not private_key:
             raise ValueError("POLYMARKET_PRIVATE_KEY ausente: live exige chave explícita")
-        self._client = ClobClient(
-            "https://clob.polymarket.com", key=private_key, chain_id=chain_id,
-            funder=proxy_wallet, signature_type=self._sig_type,
-        )
-        self._client.set_api_creds(self._client.create_or_derive_api_key())
 
-    def set_proxy(self, socks: Optional[str]) -> bool:
-        """Troca a rota do CLOB em voo. Chamada só pelo motor, entre janelas, nunca com ordem viva:
-        o cliente da lib guarda UM httpx.Client de módulo e trocá-lo no meio de uma chamada a mataria."""
-        if socks == self.socks_proxy:
-            return False
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            self._apply_proxy(self.socks_proxy)
+            from py_clob_client_v2.client import ClobClient
+
+            c = ClobClient("https://clob.polymarket.com", key=self._private_key, chain_id=self._chain_id,
+                           funder=self.proxy_wallet, signature_type=self._sig_type)
+            c.set_api_creds(c.create_or_derive_api_key())   # só aqui a rede é obrigatória
+            self._client = c
+            log.info("cliente do CLOB pronto (rota %s)", self.socks_proxy or "DIRETO")
+        return self._client
+
+    def _apply_proxy(self, socks: Optional[str]) -> None:
         import httpx
 
         import py_clob_client_v2.http_helpers.helpers as _hh
 
         old = getattr(_hh, "_http_client", None)
         _hh._http_client = httpx.Client(http2=True, proxy=socks, timeout=12.0) if socks else httpx.Client(http2=True, timeout=12.0)
-        self.socks_proxy = socks
-        # Fecha só o penúltimo: fechar o cliente recém-substituído abortaria qualquer requisição que
-        # ainda estivesse em voo nele.
+        # Fecha só o penúltimo: fechar o recém-substituído abortaria requisição ainda em voo nele.
         try:
             if self._retired is not None:
                 self._retired.close()
         except Exception:
             pass
         self._retired = old
+        self._proxy_applied = True
+
+    def set_proxy(self, socks: Optional[str]) -> bool:
+        """Troca a rota do CLOB. Chamada só pelo motor, entre ordens, nunca com chamada em voo: o
+        cliente da lib guarda UM httpx.Client de módulo e trocá-lo no meio de uma requisição a mataria."""
+        if socks == self.socks_proxy and self._proxy_applied:
+            return False
+        self.socks_proxy = socks
+        if self._client is None:
+            return False          # o cliente nasce já na rota nova; nada a trocar ainda
+        self._apply_proxy(socks)
         from src.egress import redact
 
         log.warning("rota do CLOB trocada para %s", redact(socks))
@@ -209,7 +217,7 @@ class LiveBroker:
         """FOK: executa inteiro no ato ou morre. Nunca deixa ordem descansando no book."""
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
 
-        resp = self._client.create_and_post_order(
+        resp = self.client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side="BUY"), order_type=OrderType.FOK
         ) or {}
         return self._from_immediate(resp, token_id, price, size)
@@ -217,7 +225,7 @@ class LiveBroker:
     def sell_taker(self, token_id: str, price: float, size: float) -> OrderState:
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
 
-        resp = self._client.create_and_post_order(
+        resp = self.client.create_and_post_order(
             OrderArgs(token_id=token_id, price=price, size=size, side="SELL"), order_type=OrderType.FOK
         ) or {}
         return self._from_immediate(resp, token_id, price, size)
@@ -242,24 +250,24 @@ class LiveBroker:
 
         args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
         # post_only: se cruzaria o spread o CLOB rejeita em vez de executar como taker.
-        resp = self._client.create_and_post_order(args, order_type=OrderType.GTC, post_only=True)
+        resp = self.client.create_and_post_order(args, order_type=OrderType.GTC, post_only=True)
         oid = (resp or {}).get("orderID") or (resp or {}).get("id")
         if not oid:
             raise RuntimeError(f"CLOB não devolveu orderID: {resp}")
         return str(oid)
 
     def poll(self, order_id: str) -> OrderState:
-        return order_state_from_clob(order_id, self._client.get_order(order_id) or {})
+        return order_state_from_clob(order_id, self.client.get_order(order_id) or {})
 
     def resolve(self, order_id: str, since_ts: float) -> OrderState:
         """Destino definitivo de uma ordem antiga. get_order devolve None para ordem que já saiu do
         book (executada, cancelada ou inexistente; medido em 18/09/2026), e aí quem sabe são os trades."""
         from py_clob_client_v2.clob_types import TradeParams
 
-        o = self._client.get_order(order_id)
+        o = self.client.get_order(order_id)
         if o:
             return order_state_from_clob(order_id, o)
-        trades = self._client.get_trades(TradeParams(after=int(since_ts) - 5, before=int(since_ts) + 900))
+        trades = self.client.get_trades(TradeParams(after=int(since_ts) - 5, before=int(since_ts) + 900))
         qty, avg = fills_from_trades(trades, order_id)
         return OrderState(order_id=order_id, token_id="", price=avg, size=qty, filled=qty, avg_price=avg, open=False, status="GONE")
 
@@ -271,7 +279,7 @@ class LiveBroker:
             from types import SimpleNamespace as OrderPayload  # type: ignore
 
         try:
-            resp = self._client.cancel_order(OrderPayload(orderID=order_id)) or {}
+            resp = self.client.cancel_order(OrderPayload(orderID=order_id)) or {}
         except Exception as e:
             log.warning("cancel %s falhou: %s", order_id, e)
             return False
@@ -284,12 +292,12 @@ class LiveBroker:
         return not self.poll(order_id).open
 
     def cancel_all(self) -> None:
-        self._client.cancel_all()
+        self.client.cancel_all()
 
     def collateral(self, open_cost_usd: float = 0.0, realized_pnl_usd: float = 0.0) -> float:
         from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
-        res = self._client.get_balance_allowance(
+        res = self.client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=self._sig_type)
         )
         return int(res.get("balance", 0)) / 1e6

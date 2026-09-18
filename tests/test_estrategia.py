@@ -370,3 +370,112 @@ def test_proxy_credentials_are_never_logged():
                         probe_fn=lambda s: None if s == "socks5://tor" else ("2.2.2.2", "SE"), clock=clock)
     mon.check()
     assert spy.keys() == ["egress_switch"] and "p@vpn" not in spy.sent[0][1] and "***@vpn" in spy.sent[0][1]
+
+
+# ------------------------------------------------------------------ portões do Jev separáveis
+def test_jev_gate_off_keeps_the_regime_adjustment(tmp_path):
+    clock = Clock(TS + 60)
+    eng, pm, ledger, jev = build(tmp_path, clock, jev_gate=False, max_requotes=1)
+    eng.jev = jev = __import__("tests.test_engine", fromlist=["fake_jev"]).fake_jev(direction=0.05)  # Jev contra o Up
+    assert eng.step(clock.now) == "unfilled"                   # sem portão, o veto de direção não corta
+    d = [e for e in events(ledger) if e["event"] == "decision"][0]
+    assert d["vetoed"] is None and d["sigma_mult"] != 1.0 and jev._cls.calls == 1
+
+
+def test_both_jev_flags_off_skips_the_call_entirely(tmp_path):
+    clock = Clock(TS + 60)
+    eng, pm, ledger, jev = build(tmp_path, clock, jev_gate=False, jev_regime_adjust=False, max_requotes=1)
+    assert eng.step(clock.now) == "unfilled"
+    d = [e for e in events(ledger) if e["event"] == "decision"][0]
+    assert jev._cls.calls == 0                                  # não paga latência nem chamada
+    assert d["jev"] is None and d["sigma_mult"] == 1.0 and d["p_adj"] == d["p_raw"]
+
+
+def test_jev_gate_on_still_vetoes(tmp_path):
+    clock = Clock(TS + 60)
+    eng, pm, ledger, _ = build(tmp_path, clock)
+    eng.jev = __import__("tests.test_engine", fromlist=["fake_jev"]).fake_jev(direction=0.05)
+    assert eng.step(clock.now) == "vetoed"
+
+
+# ------------------------------------------------------------------ Jev como meta-julgamento e como tamanho
+def fake_jev_meta(reliability=0.9, anomaly=0.1, probs=None):
+    """Conjunto 'meta': sem pergunta de direção, com confiabilidade da estimativa do modelo."""
+    from types import SimpleNamespace
+
+    from src.jev_5m import JevGate
+
+    class C:
+        calls = 0
+        last_state = None
+
+        def system_one(self, state, questions):
+            C.calls += 1
+            C.last_state = state
+            assert "direction_up" not in questions and "reliability" in questions
+            return SimpleNamespace(
+                scores={"regime": SimpleNamespace(score=1.0, probabilities=probs or {0: .2, 1: .5, 2: .3}, confidence=0.6)},
+                nouls={"anomaly": SimpleNamespace(noul=anomaly), "reliability": SimpleNamespace(noul=reliability)},
+            )
+
+    gate = JevGate(client_factory=lambda: C(), question_set="meta")
+    gate._cls = C
+    return gate
+
+
+def test_meta_question_set_sends_the_model_estimate_and_drops_direction(tmp_path):
+    clock = Clock(TS + 60)
+    jev = fake_jev_meta()
+    eng, pm, ledger, _ = build(tmp_path, clock, jev=jev, jev_question_set="meta", max_requotes=1)
+    assert eng.step(clock.now) == "unfilled"
+    st = jev._cls.last_state
+    assert 0 < st["model_p_up"] < 1                                  # a pergunta meta precisa do p do modelo
+    d = [e for e in events(ledger) if e["event"] == "decision"][0]
+    assert d["jev"]["reliability_p"] == 0.9 and d["jev"]["direction_p_up"] is None
+    assert d["vetoed"] is None                                        # sem pergunta de direção, sem veto de lado
+
+
+def test_meta_veto_uses_reliability(tmp_path):
+    clock = Clock(TS + 60)
+    eng, pm, ledger, _ = build(tmp_path, clock, jev=fake_jev_meta(reliability=0.2),
+                               jev_question_set="meta", jev_min_reliability=0.5)
+    assert eng.step(clock.now) == "vetoed"
+    assert "confiança" in [e for e in events(ledger) if e["event"] == "decision"][0]["vetoed"]
+
+
+def test_sizing_by_jev_reliability(tmp_path):
+    from src.model import stake_for
+
+    assert stake_for(0.12, "jev", 1.0, 5.0, reliability=1.0) == 5.0
+    assert stake_for(0.12, "jev", 1.0, 5.0, reliability=0.5) == 3.0
+    assert stake_for(0.12, "jev", 1.0, 5.0, reliability=None) == 1.0   # sem julgamento, aposta o piso
+    assert stake_for(0.06, "jev", 1.0, 5.0, reliability=1.0) == 3.0
+
+    clock = Clock(TS + 60)
+    eng, pm, ledger, _ = build(tmp_path, clock, jev=fake_jev_meta(reliability=0.25), jev_question_set="meta",
+                               sizing_mode="jev", min_stake_usd=1.0, max_stake_usd=5.0, min_shares=1.0,
+                               min_notional_usd=0.5, max_requotes=1)
+    assert eng.step(clock.now) == "unfilled"
+    posted = [e for e in events(ledger) if e["event"] == "order_posted"][0]
+    # Confiança baixa pede aposta pequena, mas o mercado não vende menos de 5 shares: o motor sobe ao
+    # piso em vez de perder a janela, e registra que subiu.
+    assert posted["reliability"] == 0.25 and posted["stake"] < 5.0
+    assert posted["shares"] == pytest.approx(5.0) and any(e["event"] == "stake_raised_to_minimum" for e in events(ledger))
+
+
+def test_stake_below_the_market_minimum_is_skipped_when_it_does_not_fit(tmp_path):
+    """5 shares a 0,61 custam 3,05. Com teto de 2 não existe ordem possível: a janela fecha com o motivo
+    certo, em vez de 'saldo insuficiente' com saldo sobrando."""
+    clock2 = Clock(TS + 60)
+    eng2, _, ledger2, _ = build(tmp_path / "b", clock2, sizing_mode="conviction", min_stake_usd=1.0, max_stake_usd=2.0)
+    assert eng2.step(clock2.now).startswith("skip:mínimo do mercado acima do teto")
+    assert ledger2.is_final(TS)
+
+
+def test_sizing_by_jev_requires_the_meta_question_set():
+    from src.config import Settings
+
+    with pytest.raises(ValueError, match="SIZING_MODE=jev"):
+        Settings.from_env({"SIZING_MODE": "jev"})
+    s = Settings.from_env({"SIZING_MODE": "jev", "JEV_QUESTION_SET": "meta"})
+    assert s.sizing_mode == "jev" and s.jev_question_set == "meta"

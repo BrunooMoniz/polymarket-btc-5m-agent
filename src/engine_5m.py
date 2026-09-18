@@ -262,28 +262,32 @@ class Engine:
             return self._skip(ts, "recotações esgotadas", final=True)
         # ---- Jev: regime + vetos ----------------------------------------
         # Um veredito vale por jev_min_interval_s (recotações e reavaliações reaproveitam);
-        # passado o intervalo, nova chamada até o orçamento da janela.
-        cached = self._last_verdict.get(ts)
-        if cached is not None and now - cached[0] < self.s.jev_min_interval_s:
-            verdict = cached[1]
+        # passado o intervalo, nova chamada até o orçamento da janela. Com os dois portões
+        # desligados não se chama o Jev: a ordem sai ~0,7 s antes.
+        if not self.s.jev_gate and not self.s.jev_regime_adjust:
+            verdict = None
         else:
-            if self._jev_calls.get(ts, 0) >= self.s.max_jev_calls_per_window:
-                return self._skip(ts, "orçamento de chamadas ao Jev esgotado", final=True)
-            state = self._jev_state(ts, market, now, strike, px, sigma)
-            self._jev_calls[ts] = self._jev_calls.get(ts, 0) + 1
-            try:
-                verdict = self.jev.evaluate(state)
-            except Exception as e:
-                self.ledger.journal("jev_error", ts=ts, error=repr(e))
-                return "jev_error"
-            self._last_verdict[ts] = (now, verdict)
-            self.ledger.upsert(ts, jev_calls=self._jev_calls[ts])
-            if self.clock() - now > 3.0:
-                # Jev lento (ou fila atrás de um shadow): preço e book desta decisão envelheceram.
-                # O veredito fica guardado; o próximo passo decide com dados frescos.
-                return "jev_slow"
+            cached = self._last_verdict.get(ts)
+            if cached is not None and now - cached[0] < self.s.jev_min_interval_s:
+                verdict = cached[1]
+            else:
+                if self._jev_calls.get(ts, 0) >= self.s.max_jev_calls_per_window:
+                    return self._skip(ts, "orçamento de chamadas ao Jev esgotado", final=True)
+                state = self._jev_state(ts, market, now, strike, px, sigma, p_raw)
+                self._jev_calls[ts] = self._jev_calls.get(ts, 0) + 1
+                try:
+                    verdict = self.jev.evaluate(state)
+                except Exception as e:
+                    self.ledger.journal("jev_error", ts=ts, error=repr(e))
+                    return "jev_error"
+                self._last_verdict[ts] = (now, verdict)
+                self.ledger.upsert(ts, jev_calls=self._jev_calls[ts])
+                if self.clock() - now > 3.0:
+                    # Jev lento (ou fila atrás de um shadow): preço e book desta decisão envelheceram.
+                    # O veredito fica guardado; o próximo passo decide com dados frescos.
+                    return "jev_slow"
 
-        mult = regime_multiplier(verdict.p_chop, verdict.p_trend)
+        mult = regime_multiplier(verdict.p_chop, verdict.p_trend) if (verdict and self.s.jev_regime_adjust) else 1.0
         p_adj = p_up(delta, px, sigma, tau, mult)
         cand2 = best_candidate(p_adj, book_up, book_down, market.token_up, market.token_down, market.tick, market.fee_rate)
         entry = entry_for(cand2, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge) if cand2 else None
@@ -292,11 +296,12 @@ class Engine:
             reason = f"edge após regime {(cand2.edge_maker if cand2 else float('nan')):.3f} < {self.s.min_net_edge:.3f}"
         elif self.s.favored_side_only and cand2.p_side < 0.5:
             reason = f"lado {cand2.side} não é o favorecido pelo modelo após regime (p={cand2.p_side:.2f})"
-        else:
-            reason = veto(verdict, cand2.side, self.s.anomaly_max, self.s.jev_min_side_p)
+        elif verdict is not None and self.s.jev_gate:
+            reason = veto(verdict, cand2.side, self.s.anomaly_max, self.s.jev_min_side_p, self.s.jev_min_reliability)
 
         self.ledger.journal(
-            "decision", **eval_rec, jev=verdict.raw, jev_latency_ms=verdict.latency_ms, sigma_mult=round(mult, 3),
+            "decision", **eval_rec, jev=verdict.raw if verdict else None,
+            jev_latency_ms=verdict.latency_ms if verdict else None, sigma_mult=round(mult, 3),
             p_adj=round(p_adj, 4), side=cand2.side if cand2 else None, limit=cand2.limit_price if cand2 else None,
             edge_adj=round(cand2.edge_maker, 4) if cand2 else None, vetoed=reason,
             entry_kind=entry.kind if entry else None, entry_edge=round(entry.edge, 4) if entry else None,
@@ -305,10 +310,11 @@ class Engine:
             log.info("janela %s: sem ordem (%s)", ts, reason)
             return "vetoed"
         assert cand2 is not None and entry is not None
-        return self._place(ts, market, cand2, p_adj, now, entry)
+        return self._place(ts, market, cand2, p_adj, now, entry, verdict)
 
     # ------------------------------------------------------------------ ordem
-    def _place(self, ts: int, market: Market5m, cand: Candidate, p_adj: float, now: float, entry: Entry) -> str:
+    def _place(self, ts: int, market: Market5m, cand: Candidate, p_adj: float, now: float, entry: Entry,
+               verdict: Any = None) -> str:
         # Reconfere o Price to Beat antes de arriscar dinheiro: se o valor consolidado mudou
         # desde a primeira leitura, descarta esta decisão e recalcula no próximo passo.
         fresh = self.pm.price_to_beat(ts)
@@ -322,7 +328,9 @@ class Engine:
             return "strike_changed"
 
         collateral = self._collateral()  # no live é uma ida ao CLOB pelo proxy (1-3 s): antes do book, não depois
-        stake = min(stake_for(entry.edge, self.s.sizing_mode, self.s.min_stake_usd, self.s.max_stake_usd), collateral)
+        reliability = getattr(verdict, "reliability_p", None)
+        stake = min(stake_for(entry.edge, self.s.sizing_mode, self.s.min_stake_usd, self.s.max_stake_usd,
+                              reliability=reliability), collateral)
         # Book fresco do lado escolhido: o da decisão já tem a latência do Jev (~0,7 s) e o post
         # ainda leva o tempo do proxy. Limite velho = "post-only cruza o book" (13 de 16 erros em 18/09).
         book = self.pm.book(cand.token_id)
@@ -347,7 +355,18 @@ class Engine:
                     return "edge_gone_at_post"
                 cand = replace(cand, limit_price=limit, edge_maker=edge, best_bid=book.best_bid, best_ask=book.best_ask)
 
-        shares = shares_for(stake, cand.limit_price, max(self.s.min_shares, market.min_size), self.s.min_notional_usd)
+        # O mercado tem mínimo de 5 shares: abaixo de min_shares x preço não existe ordem. Sizing
+        # dinâmico sobe até esse piso quando ele cabe no teto; não cabendo, a janela fica de fora.
+        min_shares = max(self.s.min_shares, market.min_size)
+        floor_usd = min_shares * cand.limit_price
+        if stake < floor_usd:
+            if floor_usd > min(self.s.max_stake_usd, collateral) + 1e-9:
+                reason = ("mínimo do mercado acima do teto" if floor_usd > self.s.max_stake_usd
+                          else f"saldo insuficiente (colateral {collateral:.2f})")
+                return self._skip(ts, f"{reason}: {min_shares:.0f} shares a {cand.limit_price:.2f} = {floor_usd:.2f}", final=True)
+            self._journal_throttled("stake_raised_to_minimum", ts, 30, stake=round(stake, 2), floor=round(floor_usd, 2))
+            stake = floor_usd
+        shares = shares_for(stake, cand.limit_price, min_shares, self.s.min_notional_usd)
         if shares is None:
             return self._skip(ts, f"saldo insuficiente (colateral {collateral:.2f}, preço {cand.limit_price:.2f})", final=True)
 
@@ -366,7 +385,8 @@ class Engine:
             order_id=oid, requotes=requotes + 1, p_model=p_adj, reason=None,
         )
         self.ledger.journal("order_posted", ts=ts, order_id=oid, side=cand.side, limit=cand.limit_price, shares=shares,
-                            p_adj=p_adj, post_ms=post_ms, phase=int(now - ts), mode=getattr(self.broker, "mode", "?"))
+                            p_adj=p_adj, post_ms=post_ms, phase=int(now - ts), stake=round(stake, 2),
+                            reliability=reliability, mode=getattr(self.broker, "mode", "?"))
         log.info("janela %s: ordem %s %s x%.2f @ %.2f (p=%.3f, edge=%.3f, post %d ms)", ts, oid, cand.side, shares, cand.limit_price, p_adj, cand.edge_maker, post_ms)
 
         deadline = now + self.s.order_ttl_s
@@ -722,7 +742,8 @@ class Engine:
         return text
 
     # ------------------------------------------------------------------ Jev
-    def _jev_state(self, ts: int, market: Market5m, now: float, strike: float, px: float, sigma: float) -> Dict[str, Any]:
+    def _jev_state(self, ts: int, market: Market5m, now: float, strike: float, px: float, sigma: float,
+                   model_p_up: Optional[float] = None) -> Dict[str, Any]:
         ext = self.feed.extremes(ts)
         sig5 = self.feed.sigma_1s(now, 300)
         sig15 = self.feed.sigma_1s(now, 900)
@@ -740,6 +761,7 @@ class Engine:
             window_high=ext[1] if ext else None, returns_pct=returns,
             sigma_5m_usd=px * sigma * math.sqrt(300), sigma_ratio_5m_vs_15m=ratio,
             typical_abs_move_5m_usd=self.typical_abs_move,
+            model_p_up=model_p_up if self.s.jev_question_set == "meta" else None,
         )
 
     # ------------------------------------------------------------------ liquidação

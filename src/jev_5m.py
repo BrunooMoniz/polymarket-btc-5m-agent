@@ -43,6 +43,21 @@ DIRECTION_INSTRUCTIONS = (
     "to the opening Price to Beat, so that the market resolves Up? A tie resolves Up."
 )
 
+# Conjunto "meta": em vez de pedir a direção (que a fórmula responde melhor: em 99 janelas a direção
+# do Jev ficou em Brier 0,247 contra 0,194 do modelo, e não acrescenta nada além dele), pergunta-se
+# se a ESTIMATIVA do modelo é confiável nesta janela. Isso é julgamento, não aritmética, e serve de
+# base para o tamanho da aposta.
+RELIABILITY_INSTRUCTIONS = (
+    "The code model estimates the probability of this market resolving Up from a single idea: the "
+    "current distance to the Price to Beat, divided by the volatility over the time left, read on a "
+    "normal curve. Its estimate for this window is given as model_p_up in the state. Judging only "
+    "from the path and the feed described, is that estimate trustworthy for this particular window? "
+    "Answer yes when the path looks like ordinary diffusion the model can price: no gaps, a healthy "
+    "feed, volatility in its usual range, and no pattern the model cannot see (a steady one-way "
+    "drift, a price pinned to the Price to Beat, or repeated rejections at the same level). Answer "
+    "no when something in the path would make a diffusion model wrong here."
+)
+
 
 @dataclass
 class JevVerdict:
@@ -51,6 +66,7 @@ class JevVerdict:
     regime_confidence: float
     anomaly_p: float
     direction_p_up: float
+    reliability_p: Optional[float] = None   # 1 = a estimativa do modelo serve nesta janela
     latency_ms: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -79,6 +95,7 @@ def build_state(
     sigma_5m_usd: float,
     sigma_ratio_5m_vs_15m: Optional[float],
     typical_abs_move_5m_usd: float,
+    model_p_up: Optional[float] = None,
 ) -> Dict[str, Any]:
     delta = chainlink_now - price_to_beat
     pos_in_range = None
@@ -119,10 +136,13 @@ def build_state(
         },
         "feed": {"sample_age_s": round(sample_age_s, 1), "samples_last_60s": samples_last_60s},
         "clock": {"time_utc": dt_now.strftime("%H:%M"), "weekday": dt_now.strftime("%A")},
+        **({"model_p_up": round(model_p_up, 3)} if model_p_up is not None else {}),
     }
 
 
-def questions() -> Dict[str, Any]:
+def questions(question_set: str = "direction") -> Dict[str, Any]:
+    if question_set == "meta":
+        return questions_meta()
     from typesafe_sdk import Noul, Score
 
     return {
@@ -136,6 +156,16 @@ def questions() -> Dict[str, Any]:
         "anomaly": Noul(instructions=ANOMALY_INSTRUCTIONS),
         "direction_up": Noul(instructions=DIRECTION_INSTRUCTIONS),
     }
+
+
+def questions_meta() -> Dict[str, Any]:
+    """Mesmo custo de uma chamada: regime, anomalia e confiabilidade da estimativa do modelo."""
+    from typesafe_sdk import Noul, Score
+
+    q = questions()
+    q.pop("direction_up")
+    q["reliability"] = Noul(instructions=RELIABILITY_INSTRUCTIONS)
+    return q
 
 
 def _probs_by_int(probs: Any, n_levels: int = len(REGIME_LEVELS)) -> Dict[int, float]:
@@ -156,21 +186,25 @@ def _probs_by_int(probs: Any, n_levels: int = len(REGIME_LEVELS)) -> Dict[int, f
 def parse_response(resp: Any, latency_ms: int = 0) -> JevVerdict:
     score = resp.scores["regime"]
     anomaly = resp.nouls["anomaly"]
-    direction = resp.nouls["direction_up"]
+    reliability = resp.nouls.get("reliability")
+    # Sem a pergunta de direção (conjunto "meta") o campo fica em 0,5: nada a dizer sobre o lado.
+    direction = resp.nouls.get("direction_up")
     probs = _probs_by_int(getattr(score, "probabilities", {}))
     return JevVerdict(
         regime_score=float(score.score),
         regime_probs=probs,
         regime_confidence=float(getattr(score, "confidence", 0.0) or 0.0),
         anomaly_p=float(anomaly.noul),
-        direction_p_up=float(direction.noul),
+        direction_p_up=float(direction.noul) if direction is not None else 0.5,
+        reliability_p=float(reliability.noul) if reliability is not None else None,
         latency_ms=latency_ms,
         raw={
             "regime_score": float(score.score),
             "regime_probs": probs,
             "regime_confidence": float(getattr(score, "confidence", 0.0) or 0.0),
             "anomaly_p": float(anomaly.noul),
-            "direction_p_up": float(direction.noul),
+            "direction_p_up": float(direction.noul) if direction is not None else None,
+            "reliability_p": float(reliability.noul) if reliability is not None else None,
         },
     )
 
@@ -181,9 +215,11 @@ class JevGate:
         api_key: Optional[str] = None,
         timeout_s: float = 4.0,
         client_factory: Optional[Callable[[], Any]] = None,
+        question_set: str = "direction",
     ):
         self.api_key = api_key
         self.timeout_s = timeout_s
+        self.question_set = question_set
         self._client_factory = client_factory
         self._client = None
 
@@ -202,14 +238,19 @@ class JevGate:
 
     def evaluate(self, state: Dict[str, Any]) -> JevVerdict:
         t0 = time.time()
-        resp = self._client_or_new().system_one(state=state, questions=questions())
+        resp = self._client_or_new().system_one(state=state, questions=questions(self.question_set))
         return parse_response(resp, latency_ms=int((time.time() - t0) * 1000))
 
 
-def veto(verdict: JevVerdict, side: str, anomaly_max: float, min_side_p: float) -> Optional[str]:
+def veto(verdict: JevVerdict, side: str, anomaly_max: float, min_side_p: float,
+         min_reliability: float = 0.0) -> Optional[str]:
     """Devolve o motivo do veto ou None. Política explícita, em código."""
     if verdict.anomaly_p > anomaly_max:
         return f"anomalia {verdict.anomaly_p:.2f} > {anomaly_max:.2f}"
+    if verdict.reliability_p is not None:
+        if verdict.reliability_p < min_reliability:
+            return f"Jev dá {verdict.reliability_p:.2f} de confiança ao modelo (< {min_reliability:.2f})"
+        return None  # conjunto "meta": não existe pergunta de direção para vetar o lado
     p_side = verdict.direction_p_up if side == "Up" else 1.0 - verdict.direction_p_up
     if p_side < min_side_p:
         return f"Jev dá {p_side:.2f} para {side} (< {min_side_p:.2f})"

@@ -55,7 +55,18 @@ def build_engine(settings: Settings) -> Engine:
     feed = ChainlinkFeed(buffer)
     feed.start()
     ledger = Ledger(settings.ledger_path, settings.journal_path)
-    jev = SharedJevGate(JevGate(api_key=settings.typesafe_api_key, timeout_s=settings.jev_timeout_s))
+    # Um gate compartilhado POR conjunto de perguntas: motores que perguntam coisas diferentes não
+    # podem reaproveitar o mesmo veredito.
+    gates: dict = {}
+
+    def gate_for(question_set: str) -> SharedJevGate:
+        if question_set not in gates:
+            gates[question_set] = SharedJevGate(JevGate(api_key=settings.typesafe_api_key,
+                                                        timeout_s=settings.jev_timeout_s,
+                                                        question_set=question_set))
+        return gates[question_set]
+
+    jev = gate_for(settings.jev_question_set)
     notifier = notify.from_env(os.environ, prefix=f"[JEV 5m {settings.execution_mode.upper()}] ")
     egress = None
 
@@ -76,11 +87,17 @@ def build_engine(settings: Settings) -> Engine:
         egress.start()
         broker = LiveBroker(settings.polymarket_private_key or "", settings.proxy_wallet, settings.chain_id,
                             socks_proxy=egress.socks)
-        try:  # nenhuma ordem de processo anterior fica viva; o ledger resolve os fills no 1º passo
-            broker.cancel_all()
-        except Exception as e:
-            log.warning("cancel_all no arranque falhou: %s", e)
-            ledger.journal("boot_cancel_all_failed", error=repr(e))
+        # Nenhuma ordem de processo anterior fica viva. Só tenta com a saída boa: com a rota fora,
+        # isso construiria o cliente do CLOB e derrubaria o arranque.
+        if egress.ok():
+            try:
+                broker.cancel_all()
+            except Exception as e:
+                log.warning("cancel_all no arranque falhou: %s", e)
+                ledger.journal("boot_cancel_all_failed", error=repr(e))
+        else:
+            log.warning("arranque sem cancel_all: %s", egress.reason())
+            ledger.journal("boot_cancel_all_skipped", reason=egress.reason())
         if settings.proxy_wallet:
             WalletWatch(
                 settings.proxy_wallet, ledger, notifier, settings.data_dir / "wallet_reference.json",
@@ -96,7 +113,7 @@ def build_engine(settings: Settings) -> Engine:
     seed = seed_sigma_from_binance(httpx.Client(headers=HEADERS, timeout=4))
     log.info("sigma_1s semente (Binance, só volatilidade): %s", f"{seed:.2e}" if seed else "indisponível")
 
-    shadows = start_shadows(pm, buffer, jev, seed)
+    shadows = start_shadows(pm, buffer, gate_for, seed)
     compare = {name: s_.data_dir for name, (s_, _) in shadows.items()}
 
     def summary_extra(day: str) -> str:
@@ -126,7 +143,7 @@ def build_engine(settings: Settings) -> Engine:
     return engine
 
 
-def start_shadows(pm: PolymarketPublic, buffer: PriceBuffer, jev: SharedJevGate, seed) -> dict:
+def start_shadows(pm: PolymarketPublic, buffer: PriceBuffer, gate_for, seed) -> dict:
     """Um motor PAPER por nome em SHADOW_PROFILES, com SHADOW_<NOME>_* por cima do ambiente do live."""
     from src.execution_5m import PaperBroker
 
@@ -138,11 +155,12 @@ def start_shadows(pm: PolymarketPublic, buffer: PriceBuffer, jev: SharedJevGate,
             if s_.data_dir.resolve() == Settings.from_env().data_dir.resolve():
                 raise ValueError("shadow não pode escrever no diretório do motor principal")
             shadow_ledger = Ledger(s_.ledger_path, s_.journal_path)
-            eng = Engine(s_, cached, buffer, jev, PaperBroker(cached.book, s_.paper_bankroll_usd), shadow_ledger, seed_sigma_1s=seed)
+            eng = Engine(s_, cached, buffer, gate_for(s_.jev_question_set),
+                         PaperBroker(cached.book, s_.paper_bankroll_usd), shadow_ledger, seed_sigma_1s=seed)
             start_shadow(name, eng)
             out[name] = (s_, shadow_ledger)
-            log.info("shadow %s no ar (PAPER) | dados: %s | favored_side_only=%s | min_edge=%.3f",
-                     name, s_.data_dir, s_.favored_side_only, s_.min_net_edge)
+            log.info("shadow %s no ar (PAPER) | dados: %s | perguntas=%s | sizing=%s | gate=%s | min_edge=%.3f",
+                     name, s_.data_dir, s_.jev_question_set, s_.sizing_mode, s_.jev_gate, s_.min_net_edge)
         except Exception:
             log.exception("shadow %s não subiu; o motor principal segue", name)
     return out

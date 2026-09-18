@@ -130,14 +130,16 @@ def entry_for(cand: Candidate, min_net_edge: float, allow_taker: bool, taker_min
     return None
 
 
-def stake_for(edge: float, mode: str, min_stake: float, max_stake: float, ref_edge: float = 0.12) -> float:
-    """'fixed' aposta sempre o teto. 'conviction' cresce linearmente do piso ao teto entre o edge mínimo
-    e ref_edge (edge grande não vira aposta grande demais: o teto continua sendo o teto)."""
-    if mode != "conviction":
-        return max_stake
-    if ref_edge <= 0:
+def stake_for(edge: float, mode: str, min_stake: float, max_stake: float, ref_edge: float = 0.12,
+              reliability: Optional[float] = None) -> float:
+    """'fixed' aposta sempre o teto. 'conviction' cresce do piso ao teto entre 0 e ref_edge. 'jev'
+    multiplica a fração do edge pela confiança que o Jev dá à estimativa do modelo naquela janela
+    (sem resposta do Jev, cai no piso: tamanho grande exige julgamento explícito)."""
+    if mode == "fixed" or ref_edge <= 0:
         return max_stake
     frac = min(1.0, max(0.0, edge / ref_edge))
+    if mode == "jev":
+        frac *= 0.0 if reliability is None else min(1.0, max(0.0, reliability))
     return round(min_stake + (max_stake - min_stake) * frac, 2)
 
 

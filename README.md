@@ -15,7 +15,8 @@ Agente para o mercado `btc-updown-5m-{ts}` da Polymarket. O código precifica; o
 4. `P(Up) = Φ(d / (σ·√τ))` em código, com σ realizada por segundo do próprio feed.
 5. Se houver candidato com edge maker ≥ `MIN_NET_EDGE`, uma chamada ao Jev com estado
    sem odds: regime (Score, ajusta σ), janela anômala (Noul, veta) e direção pela regra
-   exata de resolução (Noul, veta se discordar do modelo).
+   exata de resolução (Noul, veta se discordar do modelo). Os dois papéis são separáveis por
+   `JEV_GATE` (veto) e `JEV_REGIME_ADJUST` (σ); com os dois desligados o motor nem chama o Jev.
 6. Ordem maker `post_only` um tick acima do bid (taxa zero), TTL curto, até `MAX_REQUOTES`.
    Uma posição por janela, persistida em SQLite: reinício não reentra.
 7. Liquidação pelo `closePrice` do crypto-price (empate = Up); PnL no ledger.
@@ -46,7 +47,14 @@ Cada hipótese tem uma chave e roda em shadow, em paper, antes de qualquer decis
 - `EARLY_EXIT_P` (0 = desligado): vende no bid quando o modelo passa a dar menos que isso ao lado comprado,
   respeitando `EARLY_EXIT_MIN_PHASE_S` e `EARLY_EXIT_MIN_PROCEEDS_USD`. Venda parcial deixa o resto liquidar
   normalmente; venda inteira fecha a janela como `closed`, e o PnL entra no dia e no stop diário.
-- `SIZING_MODE=conviction` + `MIN_STAKE_USD`: aposta entre o piso e `MAX_STAKE_USD` conforme o edge.
+- `SIZING_MODE=conviction` + `MIN_STAKE_USD`: aposta entre o piso e `MAX_STAKE_USD` conforme o edge. O mínimo
+  de 5 shares do mercado é respeitado: aposta pequena demais sobe ao piso, e se o piso não couber no teto a
+  janela fica de fora com esse motivo.
+- `JEV_QUESTION_SET=meta`: troca a pergunta de direção (que a fórmula responde melhor) por uma de julgamento,
+  "a estimativa do modelo é confiável nesta janela?". Com `SIZING_MODE=jev` o tamanho da aposta passa a ser
+  edge × confiabilidade, e `JEV_MIN_RELIABILITY` vira o veto. Motivo, medido em 99 janelas: a direção do Jev
+  ficou em Brier 0,247 contra 0,194 do modelo e não acrescenta nada além dele (correlação -0,07 com o erro do
+  modelo), enquanto a anomalia mostrou correlação -0,22 com o erro mesmo descontando a confiança do modelo.
 - `FAVORED_SIDE_ONLY=0`: reabre o lado cauda (a calibração de 17-18/09 sugeriu algo com n=4; é ruído até ter amostra).
 - `SIGMA_PRIOR_AUTO=1`: recalcula o prior de σ da série real acumulada de hora em hora, preso a ±`SIGMA_PRIOR_MAX_DRIFT`
   do valor configurado e só com `SIGMA_PRIOR_MIN_WINDOWS` janelas.

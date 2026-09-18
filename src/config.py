@@ -61,6 +61,14 @@ class Settings:
     # Só o lado que o modelo favorece (p >= 0,5). Cauda "barata" contra o sinal do delta foi o que
     # queimou a carteira em 17/09 e não tem evidência de edge; o sinal do delta acerta 69% aos 60 s.
     favored_side_only: bool = True
+    # Portões do Jev, separáveis para A/B: gate = veto por direção/anomalia; regime = multiplicador de σ.
+    # Com os dois desligados o motor nem chama o Jev (economiza ~0,7 s de latência por ordem).
+    # "direction" = pergunta o lado (a fórmula responde melhor); "meta" = pergunta se a estimativa do
+    # modelo é confiável nesta janela, que é julgamento e serve de base para o tamanho da aposta.
+    jev_question_set: str = "direction"
+    jev_min_reliability: float = 0.0     # veto no conjunto "meta" (0 = não veta)
+    jev_gate: bool = True
+    jev_regime_adjust: bool = True
     anomaly_max: float = 0.5
     jev_min_side_p: float = 0.45
     feed_stale_s: float = 5.0
@@ -120,8 +128,13 @@ class Settings:
         if mode not in ("paper", "live"):
             raise ValueError(f"EXECUTION_MODE inválido: {mode!r} (use paper ou live)")
         sizing = (env.get("SIZING_MODE") or "fixed").strip().lower()
-        if sizing not in ("fixed", "conviction"):
-            raise ValueError(f"SIZING_MODE inválido: {sizing!r} (use fixed ou conviction)")
+        if sizing not in ("fixed", "conviction", "jev"):
+            raise ValueError(f"SIZING_MODE inválido: {sizing!r} (use fixed, conviction ou jev)")
+        qset = (env.get("JEV_QUESTION_SET") or "direction").strip().lower()
+        if qset not in ("direction", "meta"):
+            raise ValueError(f"JEV_QUESTION_SET inválido: {qset!r} (use direction ou meta)")
+        if sizing == "jev" and qset != "meta":
+            raise ValueError("SIZING_MODE=jev exige JEV_QUESTION_SET=meta (o tamanho vem da confiabilidade)")
         return cls(
             execution_mode=mode,
             data_dir=Path(env.get("DATA_DIR") or "data"),
@@ -139,6 +152,10 @@ class Settings:
             max_jev_calls_per_window=_i(env, "MAX_JEV_CALLS_PER_WINDOW", 2),
             jev_min_interval_s=_f(env, "JEV_MIN_INTERVAL_S", 45.0),
             favored_side_only=_b(env, "FAVORED_SIDE_ONLY", True),
+            jev_question_set=(env.get("JEV_QUESTION_SET") or "direction").strip().lower(),
+            jev_min_reliability=_f(env, "JEV_MIN_RELIABILITY", 0.0),
+            jev_gate=_b(env, "JEV_GATE", True),
+            jev_regime_adjust=_b(env, "JEV_REGIME_ADJUST", True),
             anomaly_max=_f(env, "JEV_ANOMALY_MAX", 0.5),
             jev_min_side_p=_f(env, "JEV_MIN_SIDE_P", 0.45),
             feed_stale_s=_f(env, "FEED_STALE_S", 5.0),

@@ -51,3 +51,21 @@ def test_live_cancel_confirmation_paths():
 
     c.raise_on_cancel = True
     assert b.cancel("o1") is False
+
+
+def test_live_broker_boots_without_network_and_builds_the_client_only_when_used():
+    """Arranque com a rota fora não pode derrubar o serviço (em 18/09/2026 isso virou laço de
+    reinício do systemd, com a saída Tor na Alemanha)."""
+    import pytest
+
+    from src.execution_5m import LiveBroker
+
+    b = LiveBroker("0xchave", "0xproxy", socks_proxy="socks5://rota-morta:9050")
+    assert b.mode == "live" and b._client is None          # nada de rede no construtor
+    b.set_proxy("socks5://outra:9050")                      # troca antes do primeiro uso: sem efeito colateral
+    assert b.socks_proxy == "socks5://outra:9050" and b._client is None
+    with pytest.raises(Exception):
+        b.client                                            # só aqui a rede é exigida
+
+    with pytest.raises(ValueError, match="POLYMARKET_PRIVATE_KEY"):
+        LiveBroker("", "0xproxy")
