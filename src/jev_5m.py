@@ -38,6 +38,10 @@ ANOMALY_INSTRUCTIONS = (
     "volatility far outside the typical range for this asset?"
 )
 
+# As perguntas falam do ativo pelo nome; o resto do texto vale igual para BTC, ETH ou SOL.
+def _for_asset(text: str, label: str) -> str:
+    return text.replace("BTC/USD", label)
+
 DIRECTION_INSTRUCTIONS = (
     "At the end of this 5-minute window, will the Chainlink BTC/USD price be greater than or equal "
     "to the opening Price to Beat, so that the market resolves Up? A tie resolves Up."
@@ -96,6 +100,7 @@ def build_state(
     sigma_ratio_5m_vs_15m: Optional[float],
     typical_abs_move_5m_usd: float,
     model_p_up: Optional[float] = None,
+    asset_label: str = "BTC/USD",
 ) -> Dict[str, Any]:
     delta = chainlink_now - price_to_beat
     pos_in_range = None
@@ -104,7 +109,7 @@ def build_state(
     dt_now = datetime.fromtimestamp(now, timezone.utc)
     return {
         "market": {
-            "asset": "BTC/USD",
+            "asset": asset_label,
             "venue": "Polymarket 5-minute Up/Down market",
             "resolution_rule": (
                 "Resolves Up if the Chainlink BTC/USD price at the end of the 5-minute window is greater "
@@ -140,9 +145,9 @@ def build_state(
     }
 
 
-def questions(question_set: str = "direction") -> Dict[str, Any]:
+def questions(question_set: str = "direction", asset_label: str = "BTC/USD") -> Dict[str, Any]:
     if question_set == "meta":
-        return questions_meta()
+        return questions_meta(asset_label)
     from typesafe_sdk import Noul, Score
 
     return {
@@ -154,15 +159,15 @@ def questions(question_set: str = "direction") -> Dict[str, Any]:
             criteria=REGIME_LEVELS,
         ),
         "anomaly": Noul(instructions=ANOMALY_INSTRUCTIONS),
-        "direction_up": Noul(instructions=DIRECTION_INSTRUCTIONS),
+        "direction_up": Noul(instructions=_for_asset(DIRECTION_INSTRUCTIONS, asset_label)),
     }
 
 
-def questions_meta() -> Dict[str, Any]:
+def questions_meta(asset_label: str = "BTC/USD") -> Dict[str, Any]:
     """Mesmo custo de uma chamada: regime, anomalia e confiabilidade da estimativa do modelo."""
     from typesafe_sdk import Noul, Score
 
-    q = questions()
+    q = questions("direction", asset_label)
     q.pop("direction_up")
     q["reliability"] = Noul(instructions=RELIABILITY_INSTRUCTIONS)
     return q
@@ -216,10 +221,12 @@ class JevGate:
         timeout_s: float = 4.0,
         client_factory: Optional[Callable[[], Any]] = None,
         question_set: str = "direction",
+        asset_label: str = "BTC/USD",
     ):
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.question_set = question_set
+        self.asset_label = asset_label
         self._client_factory = client_factory
         self._client = None
 
@@ -238,7 +245,7 @@ class JevGate:
 
     def evaluate(self, state: Dict[str, Any]) -> JevVerdict:
         t0 = time.time()
-        resp = self._client_or_new().system_one(state=state, questions=questions(self.question_set))
+        resp = self._client_or_new().system_one(state=state, questions=questions(self.question_set, self.asset_label))
         return parse_response(resp, latency_ms=int((time.time() - t0) * 1000))
 
 

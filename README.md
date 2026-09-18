@@ -79,8 +79,15 @@ Cada hipótese tem uma chave e roda em shadow, em paper, antes de qualquer decis
 - Post sem resposta do CLOB (rede/timeout, sem status 4xx): a ordem pode ter sido aceita sem devolver id, então
   o motor manda `cancel_all` e encerra a janela. Erro 4xx é recusa: conta recotação.
 
+## Outros ativos
+`ASSET=btc|eth|sol` escolhe o mercado; cada ativo tem slug, símbolo, feed Chainlink, σ prior e movimento típico
+próprios em `src/assets.py` (ETH e SOL medidos em 79 janelas, 18/09/2026). Um motor opera UM ativo; vários ativos
+significam vários motores no mesmo processo, cada um com seu feed e seu ledger — foi assim que ETH e SOL entraram,
+como shadows em paper. Liquidez medida no mesmo dia: BTC ~17,8k, ETH ~4,2k, SOL ~4,8k, com o mesmo tick de 1 centavo
+e o mesmo mínimo de 5 shares; profundidade a 2 centavos é 10 a 30 vezes menor fora do BTC.
+
 ## Shadows (A/B sem risco)
-`SHADOW_PROFILES=control,alt` sobe um motor PAPER por nome, no mesmo processo, com o mesmo feed e os mesmos
+`SHADOW_PROFILES=control,alt` sobe um motor PAPER por nome (inclusive de outro ativo, com `SHADOW_<NOME>_ASSET`), no mesmo processo, com o mesmo feed e os mesmos
 vereditos do Jev (compartilhados), ledger próprio em `data-shadow-<nome>` e parâmetros `SHADOW_<NOME>_<VAR>` por cima
 do `.env`. Shadow é sempre paper e não recebe a chave da carteira. `control` = parâmetros do live (mede o viés do
 fill simulado); compare cada hipótese com `control`, nunca com o live. `python report_5m.py data-live --vs control=data-shadow-control taker=data-shadow-taker exit=data-shadow-exit`.

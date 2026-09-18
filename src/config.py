@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
+from src.assets import spec_for
+
 
 def _f(env: Mapping[str, str], key: str, default: float) -> float:
     raw = env.get(key)
@@ -40,6 +42,9 @@ def shadow_env(env: Mapping[str, str], name: str) -> dict:
             out[var] = livre
     if not env.get(prefix + "DATA_DIR"):
         out["DATA_DIR"] = f"data-shadow-{name.lower()}"
+    out.pop("SIGMA_PRIOR_1S", None) if env.get(prefix + "ASSET") else None   # ativo novo usa o prior dele
+    if env.get(prefix + "ASSET") and not env.get(prefix + "TYPICAL_ABS_MOVE_5M"):
+        out.pop("TYPICAL_ABS_MOVE_5M", None)
     return out
 
 
@@ -49,6 +54,7 @@ def shadow_names(env: Mapping[str, str]) -> list:
 
 @dataclass(frozen=True)
 class Settings:
+    asset: str = "btc"                         # btc | eth | sol (um motor por ativo)
     execution_mode: str = "paper"              # paper | live
     data_dir: Path = field(default_factory=lambda: Path("data"))
     paper_bankroll_usd: float = 25.0
@@ -82,6 +88,7 @@ class Settings:
     sigma_step_s: float = 30.0
     # σ_1s equivalente à σ de 5 min medida em 287 janelas resolvidas (17-18/09/2026): 0,00099/√300.
     sigma_prior_1s: float = 5.7e-5
+    typical_abs_move_5m: float = 36.6
     sigma_floor_ratio: float = 0.75   # σ usada nunca abaixo de 0,75 × prior (feed suavizado subestima)
     sigma_cap_ratio: float = 4.0      # nem acima de 4 × prior
     jev_timeout_s: float = 4.0
@@ -120,6 +127,10 @@ class Settings:
     chain_id: int = 137
 
     @property
+    def spec(self):
+        return spec_for(self.asset)
+
+    @property
     def kill_switch(self) -> Path:
         return self.data_dir / "KILL"
 
@@ -145,7 +156,9 @@ class Settings:
             raise ValueError(f"JEV_QUESTION_SET inválido: {qset!r} (use direction ou meta)")
         if sizing == "jev" and qset != "meta":
             raise ValueError("SIZING_MODE=jev exige JEV_QUESTION_SET=meta (o tamanho vem da confiabilidade)")
+        spec = spec_for(env.get("ASSET") or "btc")
         return cls(
+            asset=spec.name,
             execution_mode=mode,
             data_dir=Path(env.get("DATA_DIR") or "data"),
             paper_bankroll_usd=_f(env, "PAPER_BANKROLL_USD", 25.0),
@@ -171,7 +184,8 @@ class Settings:
             feed_stale_s=_f(env, "FEED_STALE_S", 5.0),
             sigma_lookback_s=_i(env, "SIGMA_LOOKBACK_S", 1800),
             sigma_step_s=_f(env, "SIGMA_STEP_S", 30.0),
-            sigma_prior_1s=_f(env, "SIGMA_PRIOR_1S", 5.7e-5),
+            sigma_prior_1s=_f(env, "SIGMA_PRIOR_1S", spec.sigma_prior_1s),
+            typical_abs_move_5m=_f(env, "TYPICAL_ABS_MOVE_5M", spec.typical_abs_move_5m),
             sigma_floor_ratio=_f(env, "SIGMA_FLOOR_RATIO", 0.75),
             sigma_cap_ratio=_f(env, "SIGMA_CAP_RATIO", 4.0),
             jev_timeout_s=_f(env, "JEV_TIMEOUT_S", 4.0),

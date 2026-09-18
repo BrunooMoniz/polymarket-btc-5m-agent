@@ -28,8 +28,8 @@ def window_start(now: float) -> int:
     return int(now) // WINDOW_S * WINDOW_S
 
 
-def slug_for(ts_start: int) -> str:
-    return f"btc-updown-5m-{ts_start}"
+def slug_for(ts_start: int, prefix: str = "btc-updown-5m-") -> str:
+    return f"{prefix}{ts_start}"
 
 
 def iso_utc(ts: int) -> str:
@@ -79,7 +79,7 @@ def _loads_maybe(v: Any) -> Any:
     return v
 
 
-def parse_gamma_market(obj: dict, ts_start: int) -> Market5m:
+def parse_gamma_market(obj: dict, ts_start: int, slug_prefix: str = "btc-updown-5m-") -> Market5m:
     outcomes = _loads_maybe(obj.get("outcomes"))
     tokens = _loads_maybe(obj.get("clobTokenIds"))
     if outcomes != ["Up", "Down"]:
@@ -89,7 +89,7 @@ def parse_gamma_market(obj: dict, ts_start: int) -> Market5m:
     fee = obj.get("feeSchedule") or {}
     fee_rate = float(fee.get("rate", 0.07)) if isinstance(fee, dict) else 0.07
     return Market5m(
-        slug=str(obj.get("slug") or slug_for(ts_start)),
+        slug=str(obj.get("slug") or slug_for(ts_start, slug_prefix)),
         ts_start=ts_start,
         ts_end=ts_start + WINDOW_S,
         market_id=str(obj.get("id")),
@@ -134,8 +134,14 @@ def outcome_from_prices(open_price: float, close_price: float) -> str:
 
 
 class PolymarketPublic:
-    def __init__(self, client: Optional[httpx.Client] = None, timeout: float = 6.0):
+    def __init__(self, client: Optional[httpx.Client] = None, timeout: float = 6.0, asset: str = "btc"):
+        from src.assets import spec_for
+
+        self.spec = spec_for(asset)
         self._client = client or httpx.Client(headers=HEADERS, timeout=timeout)
+
+    def slug(self, ts_start: int) -> str:
+        return slug_for(ts_start, self.spec.slug_prefix)
 
     def _get(self, url: str, params: dict) -> Any:
         r = self._client.get(url, params=params)
@@ -144,21 +150,21 @@ class PolymarketPublic:
 
     def market(self, ts_start: int) -> Optional[Market5m]:
         try:
-            data = self._get(GAMMA_URL, {"slug": slug_for(ts_start)})
+            data = self._get(GAMMA_URL, {"slug": self.slug(ts_start)})
         except Exception as e:  # rede/403: falha fechada, quem chama pula a janela
-            log.warning("gamma falhou para %s: %s", slug_for(ts_start), e)
+            log.warning("gamma falhou para %s: %s", self.slug(ts_start), e)
             return None
         if not data:
             return None
         try:
-            return parse_gamma_market(data[0], ts_start)
+            return parse_gamma_market(data[0], ts_start, self.spec.slug_prefix)
         except Exception as e:
-            log.warning("mercado %s com formato inesperado: %s", slug_for(ts_start), e)
+            log.warning("mercado %s com formato inesperado: %s", self.slug(ts_start), e)
             return None
 
     def price_to_beat(self, ts_start: int) -> Optional[PriceToBeat]:
         params = {
-            "symbol": "BTC",
+            "symbol": self.spec.symbol,
             "variant": "fiveminute",
             "eventStartTime": iso_utc(ts_start),
             "endTime": iso_utc(ts_start + WINDOW_S),
@@ -179,7 +185,7 @@ class PolymarketPublic:
     def gamma_outcome(self, ts_start: int) -> Optional[str]:
         """Fallback de liquidação: outcomePrices ["1","0"] = Up, ["0","1"] = Down (só quando fechado)."""
         try:
-            data = self._get(GAMMA_URL, {"slug": slug_for(ts_start)})
+            data = self._get(GAMMA_URL, {"slug": self.slug(ts_start)})
         except Exception:
             return None
         if not data:

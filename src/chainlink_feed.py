@@ -16,12 +16,12 @@ log = logging.getLogger("chainlink_feed")
 
 WS_URL = "wss://ws-live-data.polymarket.com"
 # Único envelope que produz dados (verificado 18/09/2026); o formato "topic" solto não devolve nada.
-SUBSCRIBE = {
-    "action": "subscribe",
-    "subscriptions": [
-        {"topic": "crypto_prices_chainlink", "type": "*", "filters": "{\"symbol\":\"btc/usd\"}"}
-    ],
-}
+def subscribe_msg(symbol: str = "btc/usd") -> dict:
+    return {"action": "subscribe", "subscriptions": [
+        {"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": symbol})}]}
+
+
+SUBSCRIBE = subscribe_msg()
 WS_HEADERS = {
     "user-agent": "Mozilla/5.0 (X11; Linux x86_64) jev-5m-agent/1.0",
     "origin": "https://polymarket.com",
@@ -33,7 +33,7 @@ Sample = Tuple[float, float]  # (ts_seconds, value_usd)
 ACCEPTED_TOPICS = (None, "crypto_prices", "crypto_prices_chainlink")
 
 
-def parse_frame(text: str) -> List[Sample]:
+def parse_frame(text: str, symbol: str = "btc/usd") -> List[Sample]:
     """Extrai amostras de um frame do WS. Formatos observados (18/09/2026):
     - primeiro frame vazio;
     - resposta ao subscribe: topic "crypto_prices", type "subscribe", payload.data = lista (~60 s de histórico);
@@ -52,8 +52,8 @@ def parse_frame(text: str) -> List[Sample]:
     payload = obj.get("payload")
     if not isinstance(payload, dict):
         return []
-    symbol = payload.get("symbol")
-    if symbol is not None and str(symbol).lower() != "btc/usd":
+    got = payload.get("symbol")
+    if got is not None and str(got).lower() != symbol:
         return []
     data = payload.get("data")
     items = data if isinstance(data, list) else [payload]
@@ -208,10 +208,11 @@ def seed_sigma_from_binance(client, limit: int = 1000) -> Optional[float]:
 class ChainlinkFeed(threading.Thread):
     """Thread daemon que mantém o PriceBuffer alimentado; reconecta com backoff."""
 
-    def __init__(self, buffer: PriceBuffer, url: str = WS_URL):
-        super().__init__(name="chainlink-feed", daemon=True)
+    def __init__(self, buffer: PriceBuffer, url: str = WS_URL, symbol: str = "btc/usd"):
+        super().__init__(name=f"chainlink-feed-{symbol.split('/')[0]}", daemon=True)
         self.buffer = buffer
         self.url = url
+        self.symbol = symbol
         self._stop = threading.Event()
         self.connected = False
         self.reconnects = 0
@@ -236,7 +237,7 @@ class ChainlinkFeed(threading.Thread):
                 async with websockets.connect(
                     self.url, additional_headers=WS_HEADERS, open_timeout=10, ping_interval=20
                 ) as ws:
-                    await ws.send(json.dumps(SUBSCRIBE))
+                    await ws.send(json.dumps(subscribe_msg(self.symbol)))
                     self.connected = True
                     backoff = 1.0
                     while not self._stop.is_set():
@@ -246,13 +247,13 @@ class ChainlinkFeed(threading.Thread):
                             raise ConnectionError("sem mensagens por 15s")
                         if isinstance(msg, bytes):
                             msg = msg.decode("utf-8", "ignore")
-                        samples = parse_frame(msg)
+                        samples = parse_frame(msg, self.symbol)
                         if samples:
                             self.buffer.add_many(samples)
             except Exception as e:
                 self.connected = False
                 self.reconnects += 1
                 self.last_error = repr(e)
-                log.warning("feed chainlink caiu (%s); reconectando em %.0fs", e, backoff)
+                log.warning("feed chainlink %s caiu (%s); reconectando em %.0fs", self.symbol, e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)

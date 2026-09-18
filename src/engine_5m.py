@@ -49,7 +49,7 @@ class Engine:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         seed_sigma_1s: Optional[float] = None,
-        typical_abs_move_5m_usd: float = 36.6,  # mediana |close-open| em 287 janelas, 17-18/09/2026
+        typical_abs_move_5m_usd: Optional[float] = None,  # default: o do ativo (src/assets.py)
         notifier: Any = None,
         egress: Any = None,
         summary_extra: Optional[Callable[[str], str]] = None,
@@ -65,7 +65,7 @@ class Engine:
         self.clock = clock
         self.sleep = sleep
         self.seed_sigma_1s = seed_sigma_1s
-        self.typical_abs_move = typical_abs_move_5m_usd
+        self.typical_abs_move = typical_abs_move_5m_usd if typical_abs_move_5m_usd is not None else settings.typical_abs_move_5m
         self._market_cache: Dict[int, Optional[Market5m]] = {}
         self._strike_cache: Dict[int, float] = {}
         self._jev_calls: Dict[int, int] = {}
@@ -176,7 +176,7 @@ class Engine:
 
     # ------------------------------------------------------------------ loop
     def run_forever(self) -> None:
-        log.info("motor 5m iniciado | modo=%s | min_edge=%.3f | stake_max=%.2f", self.s.execution_mode.upper(), self.s.min_net_edge, self.s.max_stake_usd)
+        log.info("motor 5m %s iniciado | modo=%s | min_edge=%.3f | stake_max=%.2f", self.s.asset.upper(), self.s.execution_mode.upper(), self.s.min_net_edge, self.s.max_stake_usd)
         while True:
             try:
                 self.last_action = self.step(self.clock())
@@ -785,6 +785,7 @@ class Engine:
             sigma_5m_usd=px * sigma * math.sqrt(300), sigma_ratio_5m_vs_15m=ratio,
             typical_abs_move_5m_usd=self.typical_abs_move,
             model_p_up=model_p_up if self.s.jev_question_set == "meta" else None,
+            asset_label=self.s.spec.label,
         )
 
     # ------------------------------------------------------------------ liquidação

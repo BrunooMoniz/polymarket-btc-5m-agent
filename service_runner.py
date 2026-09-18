@@ -23,6 +23,7 @@ for candidate in (Path(os.environ.get("JEV_ENV_FILE") or ".env"),):
 
 from src import calibration, notify
 from src.chainlink_feed import ChainlinkFeed, PriceBuffer, seed_sigma_from_binance
+from src.assets import spec_for
 from src.config import Settings, shadow_env, shadow_names
 from src.egress import EgressMonitor
 from src.engine_5m import Engine
@@ -50,23 +51,40 @@ def _boot_notice(ledger: Ledger, notifier, text: str, every_s: float = 600.0) ->
 def build_engine(settings: Settings) -> Engine:
     if not settings.typesafe_api_key:
         raise SystemExit("TYPESAFE_API_KEY ausente")
-    pm = PolymarketPublic()
-    buffer = PriceBuffer()
-    feed = ChainlinkFeed(buffer)
-    feed.start()
+    # Um feed e um cliente público POR ATIVO, compartilhados por todos os motores daquele ativo.
+    feeds: dict = {}
+    pms: dict = {}
+
+    def feed_for(asset: str) -> PriceBuffer:
+        if asset not in feeds:
+            buf = PriceBuffer()
+            ChainlinkFeed(buf, symbol=spec_for(asset).feed_symbol).start()
+            feeds[asset] = buf
+            log.info("feed Chainlink %s no ar", spec_for(asset).feed_symbol)
+        return feeds[asset]
+
+    def pm_for(asset: str) -> PolymarketPublic:
+        if asset not in pms:
+            pms[asset] = PolymarketPublic(asset=asset)
+        return pms[asset]
+
+    pm = pm_for(settings.asset)
+    buffer = feed_for(settings.asset)
     ledger = Ledger(settings.ledger_path, settings.journal_path)
     # Um gate compartilhado POR conjunto de perguntas: motores que perguntam coisas diferentes não
     # podem reaproveitar o mesmo veredito.
     gates: dict = {}
 
-    def gate_for(question_set: str) -> SharedJevGate:
-        if question_set not in gates:
-            gates[question_set] = SharedJevGate(JevGate(api_key=settings.typesafe_api_key,
-                                                        timeout_s=settings.jev_timeout_s,
-                                                        question_set=question_set))
-        return gates[question_set]
+    def gate_for(question_set: str, asset_label: str) -> SharedJevGate:
+        # Compartilhar veredito só faz sentido entre motores que perguntam o MESMO sobre o MESMO ativo.
+        key = (question_set, asset_label)
+        if key not in gates:
+            gates[key] = SharedJevGate(JevGate(api_key=settings.typesafe_api_key,
+                                               timeout_s=settings.jev_timeout_s,
+                                               question_set=question_set, asset_label=asset_label))
+        return gates[key]
 
-    jev = gate_for(settings.jev_question_set)
+    jev = gate_for(settings.jev_question_set, settings.spec.label)
     notifier = notify.from_env(os.environ, prefix=f"[JEV 5m {settings.execution_mode.upper()}] ")
     egress = None
 
@@ -110,10 +128,10 @@ def build_engine(settings: Settings) -> Engine:
         broker = PaperBroker(pm.book, settings.paper_bankroll_usd)
         log.info("MODO PAPER: nenhuma ordem real; banca simulada US$ %.2f", settings.paper_bankroll_usd)
 
-    seed = seed_sigma_from_binance(httpx.Client(headers=HEADERS, timeout=4))
-    log.info("sigma_1s semente (Binance, só volatilidade): %s", f"{seed:.2e}" if seed else "indisponível")
+    seed = seed_sigma_from_binance(httpx.Client(headers=HEADERS, timeout=4)) if settings.asset == "btc" else None
+    log.info("sigma_1s semente (Binance, só volatilidade): %s", f"{seed:.2e}" if seed else "sem semente (usa o prior do ativo)")
 
-    shadows = start_shadows(pm, buffer, gate_for, seed)
+    shadows = start_shadows(pm_for, feed_for, gate_for, seed)
     compare = {name: s_.data_dir for name, (s_, _) in shadows.items()}
 
     def summary_extra(day: str) -> str:
@@ -150,24 +168,28 @@ def build_engine(settings: Settings) -> Engine:
     return engine
 
 
-def start_shadows(pm: PolymarketPublic, buffer: PriceBuffer, gate_for, seed) -> dict:
-    """Um motor PAPER por nome em SHADOW_PROFILES, com SHADOW_<NOME>_* por cima do ambiente do live."""
+def start_shadows(pm_for, feed_for, gate_for, seed) -> dict:
+    """Um motor PAPER por nome em SHADOW_PROFILES, com SHADOW_<NOME>_* por cima do ambiente do live.
+    Shadow de outro ativo ganha o feed e o mercado daquele ativo, e a semente do BTC não vale para ele."""
     from src.execution_5m import PaperBroker
 
-    out = {}
-    cached = CachedPM(pm)
+    out, cached = {}, {}
     for name in shadow_names(os.environ):
         try:
             s_ = Settings.from_env(shadow_env(os.environ, name))
+            if s_.asset not in cached:
+                cached[s_.asset] = CachedPM(pm_for(s_.asset))
             if s_.data_dir.resolve() == Settings.from_env().data_dir.resolve():
                 raise ValueError("shadow não pode escrever no diretório do motor principal")
             shadow_ledger = Ledger(s_.ledger_path, s_.journal_path)
-            eng = Engine(s_, cached, buffer, gate_for(s_.jev_question_set),
-                         PaperBroker(cached.book, s_.paper_bankroll_usd), shadow_ledger, seed_sigma_1s=seed)
+            c = cached[s_.asset]
+            eng = Engine(s_, c, feed_for(s_.asset), gate_for(s_.jev_question_set, s_.spec.label),
+                         PaperBroker(c.book, s_.paper_bankroll_usd), shadow_ledger,
+                         seed_sigma_1s=seed if s_.asset == "btc" else None)
             start_shadow(name, eng)
             out[name] = (s_, shadow_ledger)
-            log.info("shadow %s no ar (PAPER) | dados: %s | perguntas=%s | sizing=%s | gate=%s | min_edge=%.3f",
-                     name, s_.data_dir, s_.jev_question_set, s_.sizing_mode, s_.jev_gate, s_.min_net_edge)
+            log.info("shadow %s no ar (PAPER) | ativo=%s | dados: %s | perguntas=%s | sizing=%s | gate=%s | σ prior=%.2e",
+                     name, s_.asset.upper(), s_.data_dir, s_.jev_question_set, s_.sizing_mode, s_.jev_gate, s_.sigma_prior_1s)
         except Exception:
             log.exception("shadow %s não subiu; o motor principal segue", name)
     return out
@@ -176,7 +198,7 @@ def start_shadows(pm: PolymarketPublic, buffer: PriceBuffer, gate_for, seed) -> 
 def main() -> None:
     settings = Settings.from_env()
     log.info("=" * 70)
-    log.info(" JEV BTC 5m ENGINE | MODO: %s | dados: %s", settings.execution_mode.upper(), settings.data_dir)
+    log.info(" JEV 5m ENGINE | ATIVO: %s | MODO: %s | dados: %s", settings.asset.upper(), settings.execution_mode.upper(), settings.data_dir)
     log.info("=" * 70)
     engine = build_engine(settings)
     engine.run_forever()
