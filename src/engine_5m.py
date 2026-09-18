@@ -54,6 +54,7 @@ class Engine:
         egress: Any = None,
         summary_extra: Optional[Callable[[str], str]] = None,
         daily_report: Optional[Callable[[], str]] = None,
+        resolutions_fn: Optional[Callable[[float], Optional[Dict[str, Any]]]] = None,
     ):
         self.s = settings
         self.pm = pm
@@ -84,6 +85,9 @@ class Engine:
         self.egress = egress
         self.summary_extra = summary_extra
         self.daily_report = daily_report
+        self.resolutions_fn = resolutions_fn      # verdade pelo dinheiro (só no live, com carteira)
+        self._resolutions: Dict[str, Any] = {}
+        self._resolutions_at = 0.0
         self.last_action = ""
 
     # ------------------------------------------------------------------ util
@@ -829,14 +833,34 @@ class Engine:
         self.reconcile_settled(now)
         return n
 
+    def _resolution(self, ts: int, now: float) -> Optional[str]:
+        """Resultado pelo dinheiro da carteira (resgate recebido ou posição zerada). O endpoint de preço
+        erra empates quase perfeitos, sempre para o lado de quem apostou; o CTF não erra."""
+        if self.resolutions_fn is None:
+            return None
+        if now - self._resolutions_at >= 240:
+            self._resolutions_at = now
+            got = self.resolutions_fn(now - 36 * 3600)
+            if got is not None:
+                self._resolutions = got
+        hit = self._resolutions.get(f"btc-updown-5m-{ts}")
+        if hit is None:
+            return None
+        row = self.ledger.get(ts) or {}
+        side = row.get("side")
+        if hit[0] == "won":
+            return side
+        return "Up" if side == "Down" else "Down" if side == "Up" else None
+
     def reconcile_settled(self, now: float) -> int:
-        """Confere liquidações locais contra a resolução oficial da Gamma; corrige e alerta se divergir."""
+        """Confere liquidação local contra a verdade: primeiro o dinheiro da carteira, depois a Gamma
+        (que deixou de devolver as janelas 5m). Corrige o PnL e alerta em cada divergência."""
         n = 0
         for row in self.ledger.settled_unreconciled():
             ts = int(row["ts"])
             if now < ts + WINDOW_S + 120:
                 continue
-            gamma = self.pm.gamma_outcome(ts)
+            gamma = self._resolution(ts, now) or self.pm.gamma_outcome(ts)
             if gamma is None:
                 if now > ts + WINDOW_S + 6 * 3600:
                     self.ledger.upsert(ts, reconciled=1)  # desiste após 6 h, mantém local

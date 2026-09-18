@@ -6,6 +6,7 @@ Uso: python report_5m.py [DATA_DIR] [--vs nome=DIR ...] [--telegram]
 """
 from __future__ import annotations
 
+import os
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -58,8 +59,14 @@ def main(data_dir: str = "data", compare=None) -> None:
     else:
         print("liquidadas: 0")
 
+    flow = None
+    wallet = os.environ.get("POLYMARKET_PROXY_WALLET")
+    if wallet and os.environ.get("REPORT_WALLET", "1") not in ("0", "false"):
+        from src.wallet_watch import wallet_flow
+        day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        flow = wallet_flow(wallet, day)
     print()
-    print(calibration.render(d, compare))
+    print(calibration.render(d, compare, wallet_flow=flow))
 
 
 if __name__ == "__main__":

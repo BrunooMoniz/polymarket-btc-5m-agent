@@ -242,6 +242,21 @@ def section_fill_rate(rows: List[dict]) -> List[str]:
     return [line]
 
 
+def section_wallet(wallet_flow: Optional[Dict[str, float]]) -> List[str]:
+    """O número que conta: dinheiro que entrou e saiu da carteira, ao lado do que o ledger acha."""
+    if not wallet_flow:
+        return []
+    w = wallet_flow
+    real = w["resgatado"] + w["vendido"] - w["comprado"]
+    lines = [f"Carteira (fonte da verdade): comprou {w['comprado']:.2f} | resgatou {w['resgatado']:.2f}"
+             + (f" | vendeu {w['vendido']:.2f}" if w["vendido"] else "")
+             + f" → realizado {real:+.2f}"]
+    if w.get("pendente"):
+        lines.append(f"  esperando resgate: US$ {w['pendente']:.2f} em {int(w.get('pendentes', 0))} posições vencedoras "
+                     "(o motor não resgata sozinho; esse dinheiro não opera)")
+    return lines
+
+
 def trade_stats(rows: List[dict]) -> Dict[str, Any]:
     s = [r for r in rows if r.get("status") in ("settled", "closed")]
     return {
@@ -317,7 +332,8 @@ def section_compare(base_name: str, base_rows: List[dict], others: Dict[str, Lis
 
 
 # ------------------------------------------------------------------ relatório
-def render(data_dir: Path, compare: Optional[Dict[str, Path]] = None, prior_1s: float = 5.7e-5) -> str:
+def render(data_dir: Path, compare: Optional[Dict[str, Path]] = None, prior_1s: float = 5.7e-5,
+           wallet_flow: Optional[Dict[str, float]] = None) -> str:
     d = Path(data_dir)
     rows, events = load_rows(d / "ledger.sqlite"), load_events(d / "journal.jsonl")
     outcome = outcomes_by_ts(rows, events)
@@ -336,6 +352,7 @@ def render(data_dir: Path, compare: Optional[Dict[str, Path]] = None, prior_1s: 
         section_early_exit(rows, events),
         section_compare(d.name, rows, {n: load_rows(Path(p) / "ledger.sqlite") for n, p in (compare or {}).items()}),
         section_fill_rate(rows),
+        section_wallet(wallet_flow),
     ]
     if len(outcome) < 100:
         blocks.append([f"Amostra: {len(outcome)} janelas. Abaixo de ~100 qualquer diferença aqui é ruído; serve para acompanhar, não para mudar estratégia."])

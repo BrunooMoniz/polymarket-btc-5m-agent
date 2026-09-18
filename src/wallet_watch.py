@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -55,6 +55,12 @@ def positions_5m(wallet: str, client: httpx.Client) -> Optional[List[dict]]:
     except Exception as e:
         log.warning("data-api positions falhou: %s", type(e).__name__)
         return None
+
+
+def won(position: dict) -> bool:
+    """Posição vencedora: preço corrente acima de meio dólar (resolvido em 1) — não o flag redeemable,
+    que também é True na perdedora."""
+    return float(position.get("curPrice") or 0) > 0.5
 
 
 @dataclass
@@ -103,8 +109,11 @@ class WalletWatch:
         positions = self._positions_fn()
         if collateral is None or positions is None:
             return None
-        value = sum(float(p.get("currentValue") or 0) for p in positions)
-        redeemable = sum(float(p.get("currentValue") or 0) for p in positions if p.get("redeemable"))
+        # Medido em 18/09/2026: ao resolver, a data-api zera currentValue de TODAS as posições, e marca
+        # redeemable=True tanto na vencedora quanto na perdedora. Quem separa é curPrice (1 = venceu,
+        # 0 = virou pó), e o valor da vencedora é size, porque cada share paga US$ 1.
+        redeemable = sum(float(p.get("size") or 0) for p in positions if won(p))
+        value = redeemable + sum(float(p.get("currentValue") or 0) for p in positions if not won(p))
         comp = self.ledger.realized_pnl_usd() - self.ledger.open_cost_usd()
         return WalletReading(collateral, value, redeemable, comp)
 
@@ -179,3 +188,75 @@ class WalletWatch:
             except Exception:
                 log.exception("falha na vigia de carteira")
             time.sleep(self.interval_s)
+
+
+ACTIVITY_URL = "https://data-api.polymarket.com/activity"
+
+
+def wallet_flow(wallet: str, since_ts: float, client: Optional[httpx.Client] = None,
+                slug_prefix: str = SLUG_PREFIX) -> Optional[Dict[str, float]]:
+    """Dinheiro que realmente entrou e saiu da carteira nos mercados do motor, desde since_ts, mais o
+    que está vencido e ainda não resgatado. É a única leitura que não depende do nosso próprio ledger."""
+    c = client or httpx.Client(headers=UA, timeout=15.0)
+    try:
+        acts: List[dict] = []
+        for page in range(20):
+            r = c.get(ACTIVITY_URL, params={"user": wallet, "limit": 500, "offset": page * 500})
+            r.raise_for_status()
+            batch = r.json()
+            acts += batch
+            if len(batch) < 500 or min((a.get("timestamp") or 0) for a in batch) < since_ts:
+                break
+        mine = [a for a in acts if (a.get("timestamp") or 0) >= since_ts
+                and str(a.get("slug") or "").startswith(slug_prefix)]
+        pos = positions_5m(wallet, c) or []
+    except Exception as e:
+        log.warning("fluxo da carteira indisponível: %s", type(e).__name__)
+        return None
+    usd = lambda a: float(a.get("usdcSize") or 0)
+    pend = [p for p in pos if won(p)]
+    return {
+        "comprado": sum(usd(a) for a in mine if a.get("type") == "TRADE" and a.get("side") == "BUY"),
+        "vendido": sum(usd(a) for a in mine if a.get("type") == "TRADE" and a.get("side") == "SELL"),
+        "resgatado": sum(usd(a) for a in mine if a.get("type") == "REDEEM"),
+        "pendente": sum(float(p.get("size") or 0) for p in pend),
+        "pendentes": float(len(pend)),
+    }
+
+
+def resolutions(wallet: str, since_ts: float, client: Optional[httpx.Client] = None,
+                slug_prefix: str = SLUG_PREFIX) -> Optional[Dict[str, Tuple[str, float]]]:
+    """Quem ganhou de verdade, pelo dinheiro: slug -> ("won", payout) | ("lost", 0).
+
+    O endpoint de preço erra o vencedor em janelas de empate quase perfeito (5 de 40 em 18/09/2026,
+    uma delas por US$ 0,28 em 80 mil, sempre a nosso favor). O CTF não erra: resgate recebido é
+    vitória, posição que sobrou valendo zero é derrota."""
+    c = client or httpx.Client(headers=UA, timeout=15.0)
+    out: Dict[str, Tuple[str, float]] = {}
+    try:
+        acts: List[dict] = []
+        for page in range(20):
+            r = c.get(ACTIVITY_URL, params={"user": wallet, "limit": 500, "offset": page * 500})
+            r.raise_for_status()
+            batch = r.json()
+            acts += batch
+            if len(batch) < 500 or min((a.get("timestamp") or 0) for a in batch) < since_ts:
+                break
+        for a in acts:
+            slug = str(a.get("slug") or "")
+            if a.get("type") != "REDEEM" or not slug.startswith(slug_prefix):
+                continue
+            pago = float(a.get("usdcSize") or 0)
+            if pago > 0:
+                anterior = out.get(slug, ("won", 0.0))[1]
+                out[slug] = ("won", anterior + pago)
+        for p_ in (positions_5m(wallet, c) or []):
+            slug = str(p_.get("slug") or "")
+            if slug in out:
+                continue
+            # "redeemable" também é True para posição perdedora: o preço é que separa ganhou de perdeu.
+            out[slug] = ("won", float(p_.get("size") or 0)) if won(p_) else ("lost", 0.0)
+    except Exception as e:
+        log.warning("resolução pela carteira indisponível: %s", type(e).__name__)
+        return None
+    return out

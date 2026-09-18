@@ -513,3 +513,75 @@ def test_partial_fill_with_cancel_ack_is_recorded_only_when_the_order_is_dead(tm
     eng.broker = PartialOpenBroker(pm.book, 25.0)
     assert eng.step(clock.now) == "cancel_unconfirmed"        # 3,0 de 8,19 com o resto casável: não grava
     assert ledger.get(TS)["status"] == "orphan" and ledger.get(TS)["filled_shares"] in (0, None)
+
+
+# ------------------------------------------------------------------ liquidação conferida pelo dinheiro
+def test_settlement_is_corrected_by_the_money_not_by_the_price_endpoint(tmp_path):
+    """Em 18/09/2026 o endpoint de preço deu o vencedor errado em 5 de 40 janelas, SEMPRE a nosso favor,
+    em empates quase perfeitos (uma por US$ 0,28 em 80 mil): US$ 60 de lucro que não existia."""
+    clock = Clock(TS + 120)
+    eng, pm, ledger, _ = build(tmp_path, clock)
+    eng.notifier = spy = Spy()
+    eng.resolutions_fn = lambda since: {f"btc-updown-5m-{TS}": ("lost", 0.0)}
+    pm.after_calls = (4, TU, (0.60, 0.61))
+    assert eng.step(clock.now) == "filled"
+    cost = ledger.get(TS)["cost_usd"]
+
+    pm.completed = (STRIKE, STRIKE + 0.28)          # empate quase perfeito: o endpoint diz que ganhamos
+    clock.now = TS + 300 + 30
+    eng.settle_pending(clock.now)
+    assert ledger.get(TS)["pnl_usd"] > 0            # provisório, ainda otimista
+
+    clock.now = TS + 300 + 200                      # a carteira diz que a posição virou pó
+    assert eng.reconcile_settled(clock.now) == 1
+    row = ledger.get(TS)
+    assert row["outcome"] == "Down" and row["pnl_usd"] == pytest.approx(-cost)
+    assert row["reconciled"] == 1 and any("mismatch" in k for k in spy.keys())
+    assert ledger.realized_pnl_usd() == pytest.approx(-cost)
+
+
+def test_money_confirms_a_win_without_touching_the_pnl(tmp_path):
+    clock = Clock(TS + 120)
+    eng, pm, ledger, _ = build(tmp_path, clock)
+    eng.notifier = spy = Spy()
+    eng.resolutions_fn = lambda since: {f"btc-updown-5m-{TS}": ("won", 8.19)}
+    pm.after_calls = (4, TU, (0.60, 0.61))
+    eng.step(clock.now)
+    pm.completed = (STRIKE, STRIKE + 50)
+    clock.now = TS + 300 + 30
+    eng.settle_pending(clock.now)
+    pnl = ledger.get(TS)["pnl_usd"]
+    clock.now = TS + 300 + 200
+    assert eng.reconcile_settled(clock.now) == 1
+    assert ledger.get(TS)["pnl_usd"] == pytest.approx(pnl) and ledger.get(TS)["reconciled"] == 1
+    assert not [k for k in spy.keys() if "mismatch" in k]
+
+
+def test_resolutions_separate_winner_from_loser_by_price_not_by_redeemable_flag():
+    from src.wallet_watch import resolutions
+
+    class R:
+        def __init__(self, d):
+            self._d = d
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._d
+
+    class C:
+        def get(self, url, params=None):
+            if "activity" in url:
+                return R([] if params["offset"] else [
+                    {"timestamp": 500, "type": "REDEEM", "usdcSize": 9.5, "slug": "btc-updown-5m-1"},
+                    {"timestamp": 500, "type": "TRADE", "usdcSize": 5.0, "slug": "btc-updown-5m-1"},
+                ])
+            # "redeemable" é True nas duas: perdedora e vencedora. O preço é que separa.
+            return R([{"slug": "btc-updown-5m-2", "size": 17.85, "curPrice": 0, "redeemable": True},
+                      {"slug": "btc-updown-5m-3", "size": 12.0, "curPrice": 1, "redeemable": True}])
+
+    r = resolutions("0xabc", since_ts=100, client=C())
+    assert r["btc-updown-5m-1"] == ("won", 9.5)      # resgate recebido
+    assert r["btc-updown-5m-2"] == ("lost", 0.0)     # sobrou valendo zero
+    assert r["btc-updown-5m-3"] == ("won", 12.0)     # ganhou e ainda não resgatou

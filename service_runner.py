@@ -123,7 +123,14 @@ def build_engine(settings: Settings) -> Engine:
             out += f"\nshadow {name}: US$ {d['pnl']:+.2f} sobre {d['staked']:.2f} | acertos {d['wins']}/{d['settled']}"
         return out
 
+    resolutions_fn = None
+    if settings.execution_mode == "live" and settings.proxy_wallet:
+        from src.wallet_watch import resolutions
+
+        resolutions_fn = lambda since: resolutions(settings.proxy_wallet, since)
+
     engine = Engine(settings, pm, buffer, jev, broker, ledger, seed_sigma_1s=seed, notifier=notifier, egress=egress,
+                    resolutions_fn=resolutions_fn,
                     summary_extra=summary_extra,
                     daily_report=lambda: calibration.render(settings.data_dir, compare, settings.sigma_prior_1s))
     flags = []

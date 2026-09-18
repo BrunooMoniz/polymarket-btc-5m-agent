@@ -32,6 +32,12 @@ def shadow_env(env: Mapping[str, str], name: str) -> dict:
     out.update({k[len(prefix):]: v for k, v in env.items() if k.startswith(prefix)})
     out["EXECUTION_MODE"] = "paper"
     out.pop("POLYMARKET_PRIVATE_KEY", None)
+    # Shadow existe para juntar evidência, e trava de risco de dinheiro real cala o experimento: em
+    # 18/09/2026 os shadows bateram o stop diário às 13:48 e ficaram 4 h sem liquidar nada, enquanto o
+    # live seguia. Sem pedido explícito, o shadow não tem stop diário nem banca curta.
+    for var, livre in (("DAILY_LOSS_LIMIT_USD", "1000000"), ("PAPER_BANKROLL_USD", "1000")):
+        if not env.get(prefix + var):
+            out[var] = livre
     if not env.get(prefix + "DATA_DIR"):
         out["DATA_DIR"] = f"data-shadow-{name.lower()}"
     return out
@@ -85,8 +91,9 @@ class Settings:
     # for muito maior que a taxa; primeiro se prova no shadow, depois se decide no live.
     allow_taker: bool = False
     taker_min_edge: float = 0.10
-    # Fração das ordens maker que executa, medida no journal. Entra na conta maker x taker.
-    maker_fill_rate: float = 0.5
+    # Fração das JANELAS que postaram maker e terminaram com posição (medida em 18/09/2026: 0,91).
+    # Contar por ordem daria 0,50 e empurraria para taker sem motivo: recotar não é falhar.
+    maker_fill_rate: float = 0.9
     maker_fill_rate_auto: bool = True   # mede no próprio ledger em vez de usar a constante
     # Saída antecipada pelo modelo (0 desliga): vende no bid quando o lado comprado desaba.
     early_exit_p: float = 0.0
@@ -170,7 +177,7 @@ class Settings:
             jev_timeout_s=_f(env, "JEV_TIMEOUT_S", 4.0),
             allow_taker=_b(env, "ALLOW_TAKER", False),
             taker_min_edge=_f(env, "TAKER_MIN_EDGE", 0.10),
-            maker_fill_rate=_f(env, "MAKER_FILL_RATE", 0.5),
+            maker_fill_rate=_f(env, "MAKER_FILL_RATE", 0.9),
             maker_fill_rate_auto=_b(env, "MAKER_FILL_RATE_AUTO", True),
             early_exit_p=_f(env, "EARLY_EXIT_P", 0.0),
             early_exit_min_phase_s=_i(env, "EARLY_EXIT_MIN_PHASE_S", 60),

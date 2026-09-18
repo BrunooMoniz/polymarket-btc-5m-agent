@@ -37,9 +37,11 @@ def test_wallet_redeem_and_consistent_pnl_do_not_alert(tmp_path):
     clock, wallet = Clock(T0), {"collateral": 20.0, "positions": []}
     w, ledger, spy = make_watch(tmp_path, clock, wallet)
     assert w.check() == "baseline"
-    # ganho de 5 ainda não resgatado: colateral caiu o custo, a posição vale 10
+    # Ganho de 5 ainda não resgatado. Formato REAL da data-api (medido em 18/09/2026): assim que o
+    # mercado resolve, currentValue vai a zero mesmo na posição vencedora; quem vale é size, porque cada
+    # share vencedora paga US$ 1.
     settle(ledger, T0, pnl=+5.0)
-    wallet.update(collateral=15.0, positions=[{"slug": "btc-updown-5m-1", "currentValue": 10.0, "redeemable": True}])
+    wallet.update(collateral=15.0, positions=[{"slug": "btc-updown-5m-1", "size": 10.0, "curPrice": 1, "currentValue": 0.0, "redeemable": True}])
     assert w.check() == "ok"
     wallet.update(collateral=25.0, positions=[])                     # resgate: muda de bolso, não de valor
     assert w.check() == "ok"
@@ -70,8 +72,8 @@ def test_wallet_skips_comparison_while_position_is_open(tmp_path):
 def test_wallet_alerts_winnings_locked_until_redeem(tmp_path):
     """O que parou o motor por 6 h em 18/09: saldo livre zerado com ganho esperando resgate."""
     clock = Clock(T0)
-    wallet = {"collateral": 0.0, "positions": [{"slug": "btc-updown-5m-1", "currentValue": 9.5, "redeemable": True},
-                                               {"slug": "btc-updown-5m-2", "currentValue": 0.0, "redeemable": True}]}
+    wallet = {"collateral": 0.0, "positions": [{"slug": "btc-updown-5m-1", "size": 9.5, "curPrice": 1, "currentValue": 0.0, "redeemable": True},
+                                               {"slug": "btc-updown-5m-2", "size": 8.0, "curPrice": 0, "currentValue": 0.0, "redeemable": True}]}
     w, ledger, spy = make_watch(tmp_path, clock, wallet)
     w.check()
     assert spy.keys() == ["wallet_locked"] and "9.50" in spy.sent[0][1]
@@ -97,6 +99,10 @@ def test_shadow_env_is_always_paper_without_wallet_key_and_in_own_dir():
     assert alt.execution_mode == "paper" and alt.polymarket_private_key is None       # nem pedindo vira live
     assert alt.favored_side_only is False and ctl.favored_side_only is True
     assert alt.min_net_edge == ctl.min_net_edge == 0.04
+    # trava de dinheiro real não cala o experimento, mas pedido explícito vale
+    assert alt.daily_loss_limit_usd >= 1e6 and alt.paper_bankroll_usd == 1000
+    preso = Settings.from_env(shadow_env({**env, "SHADOW_ALT_DAILY_LOSS_LIMIT_USD": "7"}, "alt"))
+    assert preso.daily_loss_limit_usd == 7
     assert {str(alt.data_dir), str(ctl.data_dir)} == {"data-shadow-alt", "data-shadow-control"}
 
 
@@ -277,3 +283,51 @@ def test_fill_rate_section_and_ledger_measure(tmp_path):
     ledger.upsert(T0 - 600, status="skipped", reason="sem edge")
     assert ledger.maker_fill_rate() == pytest.approx(9 / 13)     # janela que nem postou fica de fora
     assert "maker: 9/13 (69%)" in calibration.render(tmp_path)
+
+
+def test_wallet_values_a_won_position_by_size_not_by_current_value(tmp_path):
+    """A posição vencedora não resgatada aparece com currentValue 0 na data-api. Lendo currentValue, a
+    carteira parecia US$ 60 mais pobre que o ledger e o vigia disparava divergência falsa."""
+    clock = Clock(T0)
+    wallet = {"collateral": 1.0, "positions": [                                                # saldo livre não paga ordem
+        {"slug": "btc-updown-5m-1", "size": 17.85, "curPrice": 1, "currentValue": 0.0, "redeemable": True},  # ganhou
+        {"slug": "btc-updown-5m-2", "size": 9.0, "curPrice": 0, "currentValue": 0.0, "redeemable": True},    # perdeu (redeemable também!)
+    ]}
+    w, ledger, spy = make_watch(tmp_path, clock, wallet)
+    rd = w.read()
+    assert rd.redeemable_value == pytest.approx(17.85) and rd.positions_value == pytest.approx(17.85)
+    assert rd.actual == pytest.approx(18.85)
+    w.check()
+    assert spy.keys() == ["wallet_locked"] and "17.85" in spy.sent[0][1]
+
+
+def test_wallet_flow_reads_real_money_in_and_out():
+    from src.wallet_watch import wallet_flow
+
+    class FakeResp:
+        def __init__(self, data):
+            self._d = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._d
+
+    class FakeClient:
+        def get(self, url, params=None):
+            if "activity" in url:
+                if params["offset"]:
+                    return FakeResp([])
+                return FakeResp([
+                    {"timestamp": 100, "type": "TRADE", "side": "BUY", "usdcSize": 5.0, "slug": "btc-updown-5m-1"},
+                    {"timestamp": 120, "type": "REDEEM", "usdcSize": 9.5, "slug": "btc-updown-5m-1"},
+                    {"timestamp": 130, "type": "TRADE", "side": "BUY", "usdcSize": 4.0, "slug": "outro-mercado"},
+                    {"timestamp": 50, "type": "TRADE", "side": "BUY", "usdcSize": 99.0, "slug": "btc-updown-5m-0"},
+                ])
+            return FakeResp([{"slug": "btc-updown-5m-2", "size": 12.0, "curPrice": 1, "currentValue": 0.0, "redeemable": True},
+                             {"slug": "btc-updown-5m-3", "size": 8.0, "curPrice": 0, "currentValue": 0.0, "redeemable": True}])
+
+    f = wallet_flow("0xabc", since_ts=90, client=FakeClient())
+    assert f["comprado"] == 5.0 and f["resgatado"] == 9.5      # fora da janela de tempo e de outro mercado: ignorados
+    assert f["pendente"] == 12.0 and f["pendentes"] == 1.0

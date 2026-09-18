@@ -25,6 +25,7 @@ def test_entry_compares_expected_value_not_nominal_edge():
     assert entry_for(cand(edge_maker=0.02, edge_taker=0.09), 0.04, True, 0.10) is None    # nem taker nem maker
 
     c = cand(edge_maker=0.13, edge_taker=0.11)
+    assert entry_for(c, 0.04, True, 0.10, maker_fill_rate=0.9).kind == "maker"   # com a taxa real medida
     assert entry_for(c, 0.04, True, 0.10, maker_fill_rate=1.0).kind == "maker"   # se o maker sempre executa
     assert entry_for(c, 0.04, True, 0.10, maker_fill_rate=0.5).kind == "taker"   # com 50% de fill, taker ganha
     e = entry_for(c, 0.04, True, 0.10, maker_fill_rate=0.5)
