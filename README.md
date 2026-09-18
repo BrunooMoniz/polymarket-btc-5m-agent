@@ -42,8 +42,11 @@ Agente para o mercado `btc-updown-5m-{ts}` da Polymarket. O código precifica; o
 
 ## Evoluções sob bandeira (desligadas no live por default)
 Cada hipótese tem uma chave e roda em shadow, em paper, antes de qualquer decisão no live:
-- `ALLOW_TAKER=1` + `TAKER_MIN_EDGE` (0,10): entra comendo o ask (FOK, nunca deixa ordem no book) quando o
-  edge sobra muito sobre a taxa taker. Fora isso, só maker.
+- `ALLOW_TAKER=1` + `TAKER_MIN_EDGE` (0,10) + `MAKER_FILL_RATE`: entra comendo o ask (FOK, nunca deixa ordem no
+  book) quando o valor esperado do taker supera o do maker, isto é, `edge_taker > MAKER_FILL_RATE × edge_maker`.
+  Comparar os edges nominais não serve: o limite maker nunca passa do ask, então o edge maker é sempre maior e o
+  caminho taker ficaria inalcançável. Com fill de 50% e edges medianos de 0,115 (maker) e 0,091 (taker), a conta
+  dá 0,058 contra 0,091 a favor do taker.
 - `EARLY_EXIT_P` (0 = desligado): vende no bid quando o modelo passa a dar menos que isso ao lado comprado,
   respeitando `EARLY_EXIT_MIN_PHASE_S` e `EARLY_EXIT_MIN_PROCEEDS_USD`. Venda parcial deixa o resto liquidar
   normalmente; venda inteira fecha a janela como `closed`, e o PnL entra no dia e no stop diário.

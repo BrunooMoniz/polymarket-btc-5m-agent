@@ -122,12 +122,22 @@ class Entry:
     edge: float
 
 
-def entry_for(cand: Candidate, min_net_edge: float, allow_taker: bool, taker_min_edge: float) -> Optional[Entry]:
-    if cand.edge_maker >= min_net_edge:
-        return Entry("maker", cand.limit_price, cand.edge_maker)
-    if allow_taker and cand.edge_taker >= taker_min_edge:
+def entry_for(cand: Candidate, min_net_edge: float, allow_taker: bool, taker_min_edge: float,
+              maker_fill_rate: float = 1.0) -> Optional[Entry]:
+    """Maker rende mais por share, mas só às vezes executa; taker rende menos e executa sempre. O que
+    importa é o valor esperado por JANELA: taxa_de_fill x edge_maker contra edge_taker.
+
+    Sem isso o caminho taker era inalcançável por construção: o limite maker nunca passa do ask, então
+    edge_maker > edge_taker sempre, e com taker_min_edge acima do mínimo do maker o maker ganhava todas.
+    Medido em 18/09/2026: fill de 50%, edge maker mediano 0,115 contra 0,091 do taker — 0,058 contra 0,091
+    a favor do taker."""
+    maker_ok = cand.edge_maker >= min_net_edge
+    if not (allow_taker and cand.edge_taker >= taker_min_edge):
+        return Entry("maker", cand.limit_price, cand.edge_maker) if maker_ok else None
+    maker_ev = maker_fill_rate * cand.edge_maker if maker_ok else 0.0
+    if cand.edge_taker > maker_ev:
         return Entry("taker", cand.best_ask, cand.edge_taker)
-    return None
+    return Entry("maker", cand.limit_price, cand.edge_maker) if maker_ok else None
 
 
 def stake_for(edge: float, mode: str, min_stake: float, max_stake: float, ref_edge: float = 0.12,

@@ -17,19 +17,26 @@ def cand(edge_maker=0.02, edge_taker=0.0, p_side=0.62, ask=0.60):
 
 
 # ------------------------------------------------------------------ portão de entrada
-def test_entry_prefers_maker_and_only_takes_with_a_big_edge():
+def test_entry_compares_expected_value_not_nominal_edge():
+    """O limite maker nunca passa do ask, então edge_maker > edge_taker SEMPRE. Comparar os dois nominais
+    tornava o caminho taker inalcançável; o que vale é fill x edge."""
     assert entry_for(cand(edge_maker=0.06), 0.04, False, 0.10).kind == "maker"
     assert entry_for(cand(edge_maker=0.02, edge_taker=0.15), 0.04, False, 0.10) is None   # taker proibido
-    e = entry_for(cand(edge_maker=0.02, edge_taker=0.15), 0.04, True, 0.10)
-    assert e.kind == "taker" and e.price == 0.60 and e.edge == 0.15
     assert entry_for(cand(edge_maker=0.02, edge_taker=0.09), 0.04, True, 0.10) is None    # nem taker nem maker
-    assert entry_for(cand(edge_maker=0.06, edge_taker=0.20), 0.04, True, 0.10).kind == "maker"  # maker primeiro
+
+    c = cand(edge_maker=0.13, edge_taker=0.11)
+    assert entry_for(c, 0.04, True, 0.10, maker_fill_rate=1.0).kind == "maker"   # se o maker sempre executa
+    assert entry_for(c, 0.04, True, 0.10, maker_fill_rate=0.5).kind == "taker"   # com 50% de fill, taker ganha
+    e = entry_for(c, 0.04, True, 0.10, maker_fill_rate=0.5)
+    assert e.price == 0.60 and e.edge == 0.11
+    # edge taker abaixo do mínimo: continua maker mesmo com fill ruim
+    assert entry_for(cand(edge_maker=0.13, edge_taker=0.05), 0.04, True, 0.10, maker_fill_rate=0.3).kind == "maker"
 
 
 def test_taker_entry_fills_immediately_and_pays_the_ask(tmp_path):
     clock = Clock(TS + 60)
     eng, pm, ledger, _ = build(tmp_path, clock, min_net_edge=0.9, allow_taker=True, taker_min_edge=0.01)
-    assert eng.step(clock.now) == "filled"                    # maker impossível; taker come o ask
+    assert eng.step(clock.now) == "filled"                    # maker fora do mínimo; taker come o ask
     row = ledger.get(TS)
     assert row["fill_price"] == pytest.approx(0.62) and row["filled_shares"] > 0
     posted = [e for e in events(ledger) if e["event"] == "order_posted"]

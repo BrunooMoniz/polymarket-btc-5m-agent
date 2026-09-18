@@ -143,6 +143,9 @@ class Engine:
         except Exception as e:
             self._journal_throttled("egress_apply_error", ts, 60, error=repr(e))
 
+    def _entry(self, cand: Candidate) -> Optional[Entry]:
+        return entry_for(cand, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge, self.s.maker_fill_rate)
+
     def _collateral(self) -> float:
         return float(
             self.broker.collateral(
@@ -249,7 +252,7 @@ class Engine:
 
         if cand is None:
             return "no_book"
-        if entry_for(cand, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge) is None:
+        if self._entry(cand) is None:
             return "no_edge"
         if self.s.favored_side_only and cand.p_side < 0.5:
             return "no_edge_favored"  # cauda contra o sinal do delta: fora por política
@@ -290,7 +293,7 @@ class Engine:
         mult = regime_multiplier(verdict.p_chop, verdict.p_trend) if (verdict and self.s.jev_regime_adjust) else 1.0
         p_adj = p_up(delta, px, sigma, tau, mult)
         cand2 = best_candidate(p_adj, book_up, book_down, market.token_up, market.token_down, market.tick, market.fee_rate)
-        entry = entry_for(cand2, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge) if cand2 else None
+        entry = self._entry(cand2) if cand2 else None
         reason = None
         if cand2 is None or entry is None:
             reason = f"edge após regime {(cand2.edge_maker if cand2 else float('nan')):.3f} < {self.s.min_net_edge:.3f}"
