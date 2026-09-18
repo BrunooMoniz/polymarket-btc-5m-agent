@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS windows (
     exit_price REAL,
     exit_order_id TEXT,
     exit_pending INTEGER DEFAULT 0,
+    entry_kind TEXT,
     created_at REAL,
     updated_at REAL
 );
@@ -56,6 +57,7 @@ MIGRATIONS = (
     "ALTER TABLE windows ADD COLUMN exit_price REAL",                 # preço do token na saída (NÃO é BTC)
     "ALTER TABLE windows ADD COLUMN exit_order_id TEXT",
     "ALTER TABLE windows ADD COLUMN exit_pending INTEGER DEFAULT 0",
+    "ALTER TABLE windows ADD COLUMN entry_kind TEXT",                 # maker | taker
 )
 
 
@@ -122,6 +124,20 @@ class Ledger:
                 "SELECT * FROM windows WHERE status = 'settled' AND COALESCE(reconciled,0) = 0 ORDER BY ts"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def maker_fill_rate(self, last_n: int = 50) -> Optional[float]:
+        """Das janelas em que o motor postou maker, a fração que terminou COM posição. Por janela, não
+        por ordem: recotar não é falhar, e a pergunta que decide maker x taker é "vou entrar nesta janela?".
+        Janela que postou e acabou 'skipped' (recotações ou rejeições esgotadas) conta como não entrou."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status FROM windows WHERE entry_kind = 'maker' "
+                "AND status IN ('filled','settled','closed','unfilled','skipped') ORDER BY ts DESC LIMIT ?", (last_n,)
+            ).fetchall()
+        if len(rows) < 10:
+            return None
+        got = sum(1 for r in rows if r["status"] in ("filled", "settled", "closed"))
+        return got / len(rows)
 
     def exit_pending_rows(self) -> List[Dict[str, Any]]:
         """Vendas de saída antecipada sem destino confirmado: enquanto existirem, a janela não tenta

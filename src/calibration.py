@@ -220,6 +220,28 @@ def section_early_exit(rows: List[dict], events: List[dict], trigger: float = 0.
     return lines
 
 
+FILL_TERMINAL = ("filled", "settled", "closed", "unfilled", "skipped")
+
+
+def section_fill_rate(rows: List[dict]) -> List[str]:
+    """Por JANELA que postou, não por ordem: recotar não é falhar."""
+    def rate(kind: str):
+        g = [r for r in rows if r.get("entry_kind") == kind and r.get("status") in FILL_TERMINAL]
+        if not g:
+            return None
+        got = sum(1 for r in g if r["status"] in ("filled", "settled", "closed"))
+        return got, len(g)
+
+    mk, tk = rate("maker"), rate("taker")
+    if not mk:
+        return []
+    line = f"Entrada por janela que postou — maker: {mk[0]}/{mk[1]} ({mk[0] / mk[1]:.0%})"
+    if tk:
+        line += f" | taker: {tk[0]}/{tk[1]} ({tk[0] / tk[1]:.0%})"
+    line += "  (é esta taxa que decide maker × taker)"
+    return [line]
+
+
 def trade_stats(rows: List[dict]) -> Dict[str, Any]:
     s = [r for r in rows if r.get("status") in ("settled", "closed")]
     return {
@@ -231,16 +253,66 @@ def trade_stats(rows: List[dict]) -> Dict[str, Any]:
     }
 
 
+def pnl_by_window(rows: List[dict]) -> Dict[int, float]:
+    """PnL realizado por janela: liquidada, fechada antes do fim, e vendas parciais de qualquer janela."""
+    out: Dict[int, float] = {}
+    for r in rows:
+        v = (r.get("partial_pnl_usd") or 0.0)
+        if r.get("status") in ("settled", "closed"):
+            v += r.get("pnl_usd") or 0.0
+        elif not v:
+            continue
+        out[int(r["ts"])] = v
+    return out
+
+
+def paired(a: Dict[int, float], b: Dict[int, float]) -> Dict[str, Any]:
+    """Comparação pareada: só as janelas que os DOIS motores resolveram. Motores nascidos em horas
+    diferentes veem janelas diferentes, e somar tudo compara sorte, não parâmetro."""
+    common = sorted(set(a) & set(b))
+    diffs = [a[t] - b[t] for t in common]
+    n = len(diffs)
+    if n == 0:
+        return {"n": 0}
+    mean = sum(diffs) / n
+    var = sum((d - mean) ** 2 for d in diffs) / (n - 1) if n > 1 else 0.0
+    se = math.sqrt(var / n) if n > 1 else 0.0
+    wins = sum(1 for d in diffs if d > 1e-9)
+    ties = sum(1 for d in diffs if abs(d) <= 1e-9)
+    # Janelas necessárias para o efeito observado passar de 2 erros-padrão (regra de bolso, não teste formal).
+    need = int(math.ceil(4 * var / (mean ** 2))) if mean and var else None
+    # Variância zero com média não nula é o caso MAIS conclusivo (efeito idêntico em toda janela),
+    # não o menos: o teste é média contra dois erros-padrão, com um mínimo de janelas.
+    conclusive = n >= 5 and abs(mean) > 2 * se
+    return {"n": n, "total": sum(diffs), "mean": mean, "se": se, "wins": wins, "ties": ties,
+            "conclusive": conclusive, "need": need}
+
+
 def section_compare(base_name: str, base_rows: List[dict], others: Dict[str, List[dict]]) -> List[str]:
     if not others:
         return []
-    lines = ["Live × shadows (paper preenche só quando o ask chega ao limite: compare shadow com shadow; contra o live é indicativo)",
-             "  motor            liquidadas  acertos  PnL      apostado  retorno"]
-    for name, rows in [(base_name, base_rows)] + list(others.items()):
-        t = trade_stats(rows)
-        hit = f"{t['wins']}/{t['settled']}"
-        ret = f"{t['pnl'] / t['staked'] * 100:+.1f}%" if t["staked"] else "  —"
-        lines.append(f"  {name:<16} {t['settled']:>10}  {hit:>7}  {t['pnl']:>+7.2f}  {t['staked']:>8.2f}  {ret:>7}")
+    # A referência é o shadow "control" (mesmos parâmetros do live, mesmo simulador de fill). Contra o
+    # live a comparação não vale: lá o fill é real.
+    pnl = {n: pnl_by_window(r) for n, r in others.items()}
+    ref = "control" if "control" in pnl else None
+    lines = ["Comparação pareada (só janelas que os dois resolveram; referência: "
+             + (f"shadow {ref}" if ref else "motor principal") + ")",
+             "  motor        janelas   soma     por janela   ganhou/empatou   veredito"]
+    base = pnl[ref] if ref else pnl_by_window(base_rows)
+    for name, p in pnl.items():
+        if name == ref:
+            continue
+        r = paired(p, base)
+        if not r["n"]:
+            lines.append(f"  {name:<12} {'—':>7}   (ainda não dividiu janela resolvida com a referência)")
+            continue
+        verdict = ("melhor, já fora do ruído" if r["conclusive"] and r["mean"] > 0 else
+                   "pior, já fora do ruído" if r["conclusive"] else
+                   f"ruído; ~{r['need']} janelas para decidir" if r["need"] and r["need"] < 100000 else "ruído")
+        lines.append(f"  {name:<12} {r['n']:>7}  {r['total']:>+7.2f}   {r['mean']:>+8.3f}   {r['wins']:>3}/{r['ties']:<3}        {verdict}")
+    tot = {n: (len(p), sum(p.values())) for n, p in pnl.items()}
+    lines.append("  totais brutos (janelas diferentes por motor, não comparáveis entre si): "
+                 + " | ".join(f"{n} {v:+.2f} em {c}" for n, (c, v) in tot.items()))
     return lines
 
 
@@ -263,6 +335,7 @@ def render(data_dir: Path, compare: Optional[Dict[str, Path]] = None, prior_1s: 
         section_sigma(rows, prior_1s),
         section_early_exit(rows, events),
         section_compare(d.name, rows, {n: load_rows(Path(p) / "ledger.sqlite") for n, p in (compare or {}).items()}),
+        section_fill_rate(rows),
     ]
     if len(outcome) < 100:
         blocks.append([f"Amostra: {len(outcome)} janelas. Abaixo de ~100 qualquer diferença aqui é ruído; serve para acompanhar, não para mudar estratégia."])

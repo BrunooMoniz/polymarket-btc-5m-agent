@@ -87,6 +87,7 @@ class Settings:
     taker_min_edge: float = 0.10
     # Fração das ordens maker que executa, medida no journal. Entra na conta maker x taker.
     maker_fill_rate: float = 0.5
+    maker_fill_rate_auto: bool = True   # mede no próprio ledger em vez de usar a constante
     # Saída antecipada pelo modelo (0 desliga): vende no bid quando o lado comprado desaba.
     early_exit_p: float = 0.0
     early_exit_min_phase_s: int = 60
@@ -170,6 +171,7 @@ class Settings:
             allow_taker=_b(env, "ALLOW_TAKER", False),
             taker_min_edge=_f(env, "TAKER_MIN_EDGE", 0.10),
             maker_fill_rate=_f(env, "MAKER_FILL_RATE", 0.5),
+            maker_fill_rate_auto=_b(env, "MAKER_FILL_RATE_AUTO", True),
             early_exit_p=_f(env, "EARLY_EXIT_P", 0.0),
             early_exit_min_phase_s=_i(env, "EARLY_EXIT_MIN_PHASE_S", 60),
             early_exit_min_proceeds_usd=_f(env, "EARLY_EXIT_MIN_PROCEEDS_USD", 1.0),

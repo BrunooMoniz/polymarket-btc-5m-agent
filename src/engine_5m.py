@@ -77,6 +77,8 @@ class Engine:
         self._last_mark: Dict[int, float] = {}
         self._last_throttled: Dict[Any, float] = {}
         self._prior_checked_at = 0.0
+        self._fill_rate_at = 0.0
+        self._fill_rate_cached: Optional[float] = None
         self._prior_learned: Optional[float] = None
         self.notifier = notifier if notifier is not None else NullNotifier()
         self.egress = egress
@@ -144,7 +146,21 @@ class Engine:
             self._journal_throttled("egress_apply_error", ts, 60, error=repr(e))
 
     def _entry(self, cand: Candidate) -> Optional[Entry]:
-        return entry_for(cand, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge, self.s.maker_fill_rate)
+        return entry_for(cand, self.s.min_net_edge, self.s.allow_taker, self.s.taker_min_edge, self._fill_rate())
+
+    def _fill_rate(self) -> float:
+        """Taxa de fill do maker: a medida no próprio ledger quando há amostra, senão a configurada.
+        Recalculada a cada 10 min; é ela que decide se vale esperar no book ou pagar a taxa."""
+        if not self.s.allow_taker or not self.s.maker_fill_rate_auto:
+            return self.s.maker_fill_rate
+        now = self.clock()
+        if now - self._fill_rate_at >= 600:
+            self._fill_rate_at = now
+            measured = self.ledger.maker_fill_rate()
+            if measured is not None and measured != self._fill_rate_cached:
+                self.ledger.journal("maker_fill_rate", measured=round(measured, 3), configured=self.s.maker_fill_rate)
+            self._fill_rate_cached = measured
+        return self._fill_rate_cached if self._fill_rate_cached is not None else self.s.maker_fill_rate
 
     def _collateral(self) -> float:
         return float(
@@ -385,7 +401,7 @@ class Engine:
         post_ms = int((time.monotonic() - t_post) * 1000)
         self.ledger.upsert(
             ts, status="quoting", side=cand.side, limit_price=cand.limit_price, shares=shares,
-            order_id=oid, requotes=requotes + 1, p_model=p_adj, reason=None,
+            order_id=oid, requotes=requotes + 1, p_model=p_adj, reason=None, entry_kind="maker",
         )
         self.ledger.journal("order_posted", ts=ts, order_id=oid, side=cand.side, limit=cand.limit_price, shares=shares,
                             p_adj=p_adj, post_ms=post_ms, phase=int(now - ts), stake=round(stake, 2),
@@ -459,7 +475,7 @@ class Engine:
         post_ms = int((time.monotonic() - t_post) * 1000)
         oid = st.order_id or f"taker-{ts}"
         self.ledger.upsert(ts, status="quoting", side=cand.side, limit_price=cand.limit_price, shares=shares,
-                           order_id=oid, requotes=requotes + 1, p_model=p_adj, reason=None)
+                           order_id=oid, requotes=requotes + 1, p_model=p_adj, reason=None, entry_kind="taker")
         self.ledger.journal("order_posted", ts=ts, order_id=oid, side=cand.side, limit=cand.limit_price, shares=shares,
                             p_adj=p_adj, post_ms=post_ms, kind="taker", mode=getattr(self.broker, "mode", "?"))
         if st.filled <= 0 and st.status not in ("KILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):

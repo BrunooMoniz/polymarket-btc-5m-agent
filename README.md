@@ -27,6 +27,9 @@ Agente para o mercado `btc-updown-5m-{ts}` da Polymarket. O código precifica; o
   região, egress fora/normalizado, cancelamento não confirmado, kill switch, stop diário, feed parado, carteira
   divergente, saldo preso esperando resgate, erro no loop e o resumo do dia (o dia do ledger é UTC: vira às 21:00 de
   Brasília) seguido da calibração acumulada. Fila em thread própria; falha de envio nunca afeta o motor.
+- **Comparação pareada**: o relatório compara cada shadow com o `control` **só nas janelas que os dois resolveram**,
+  com média por janela, quantas ele ganhou e uma estimativa de quantas janelas faltam para o efeito sair do ruído.
+  Motores nascidos em horas diferentes veem janelas diferentes; somar tudo compara sorte, não parâmetro.
 - **Calibração** (`report_5m.py`): Brier por faixa de probabilidade, fase da janela e regime do Jev, modelo × mid do
   book, efeito do veto, execução (fill, rejeição por book cruzado, latência do post, tempo até o fill), taker
   hipotético, σ realizada × prior e o contrafactual de saída antecipada. O motor grava o resultado de TODA janela
@@ -45,8 +48,9 @@ Cada hipótese tem uma chave e roda em shadow, em paper, antes de qualquer decis
 - `ALLOW_TAKER=1` + `TAKER_MIN_EDGE` (0,10) + `MAKER_FILL_RATE`: entra comendo o ask (FOK, nunca deixa ordem no
   book) quando o valor esperado do taker supera o do maker, isto é, `edge_taker > MAKER_FILL_RATE × edge_maker`.
   Comparar os edges nominais não serve: o limite maker nunca passa do ask, então o edge maker é sempre maior e o
-  caminho taker ficaria inalcançável. Com fill de 50% e edges medianos de 0,115 (maker) e 0,091 (taker), a conta
-  dá 0,058 contra 0,091 a favor do taker.
+  caminho taker ficaria inalcançável. `MAKER_FILL_RATE_AUTO` mede a taxa no próprio ledger, por JANELA que postou
+  (recotar não é falhar) — medida em 18/09/2026: 91%, contra os 50% que a contagem por ordem sugeria, o que mantém
+  o maker à frente (0,105 contra 0,091).
 - `EARLY_EXIT_P` (0 = desligado): vende no bid quando o modelo passa a dar menos que isso ao lado comprado,
   respeitando `EARLY_EXIT_MIN_PHASE_S` e `EARLY_EXIT_MIN_PROCEEDS_USD`. Venda parcial deixa o resto liquidar
   normalmente; venda inteira fecha a janela como `closed`, e o PnL entra no dia e no stop diário.

@@ -220,3 +220,60 @@ def test_shared_jev_gate_shares_a_failure_instead_of_queueing_timeouts():
     with pytest.raises(TimeoutError):
         shared.evaluate(st)
     assert len(calls) == 2
+
+
+# ------------------------------------------------------------------ comparação pareada
+def test_paired_comparison_only_uses_shared_windows():
+    from src.calibration import paired
+
+    a = {100: +5.0, 200: -1.0, 300: +9.9}      # 300 só existe em "a": entra no total bruto, não na comparação
+    b = {100: +1.0, 200: -1.0}
+    r = paired(a, b)
+    assert r["n"] == 2 and r["total"] == pytest.approx(4.0) and r["mean"] == pytest.approx(2.0)
+    assert r["wins"] == 1 and r["ties"] == 1
+    assert paired({}, b)["n"] == 0
+
+
+def test_paired_comparison_says_when_it_is_still_noise():
+    from src.calibration import paired
+
+    vals = [5.0 if i % 2 else -5.0 for i in range(20)]
+    vals[0] = -4.0                                               # média minúscula, variância enorme
+    ruido = paired(dict(enumerate(vals)), {i: 0.0 for i in range(20)})
+    assert not ruido["conclusive"] and ruido["need"] > 1000      # nessa toada não se decide nunca
+
+    empate = paired({i: 1.0 for i in range(6)}, {i: 1.0 for i in range(6)})
+    assert not empate["conclusive"] and empate["need"] is None    # diferença exatamente zero
+    claro = paired({i: 2.0 for i in range(20)}, {i: 0.0 for i in range(20)})
+    assert claro["conclusive"] and claro["mean"] == pytest.approx(2.0)
+
+
+def test_report_compares_against_control_not_against_the_live(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.sqlite", tmp_path / "journal.jsonl")
+    ledger.upsert(T0, status="settled", pnl_usd=+9.0, cost_usd=5.0, outcome="Up", side="Up")   # live "sortudo"
+    dirs = {}
+    for name, pnl in (("control", -1.0), ("alt", +3.0)):
+        d = tmp_path / f"data-shadow-{name}"
+        sl = Ledger(d / "ledger.sqlite", d / "journal.jsonl")
+        for i, v in enumerate((pnl, pnl)):
+            sl.upsert(T0 + 300 * i, status="settled", pnl_usd=v, cost_usd=5.0, outcome="Up", side="Up")
+        dirs[name] = d
+    text = calibration.render(tmp_path, dirs)
+    assert "referência: shadow control" in text
+    assert "alt" in text and "+8.00" in text                     # 2 janelas x (+3 - (-1))
+    assert "não comparáveis entre si" in text
+
+
+def test_fill_rate_section_and_ledger_measure(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.sqlite", tmp_path / "journal.jsonl")
+    assert ledger.maker_fill_rate() is None                      # amostra curta não vira taxa
+    for i in range(12):
+        ledger.upsert(T0 + 300 * i, status="filled" if i % 4 else "unfilled", entry_kind="maker")
+    assert ledger.maker_fill_rate() == pytest.approx(9 / 12)
+    ledger.upsert(T0 + 99999, status="filled", entry_kind="taker")
+    assert ledger.maker_fill_rate() == pytest.approx(9 / 12)     # taker não entra na conta do maker
+    ledger.upsert(T0 - 300, status="skipped", entry_kind="maker", reason="recotações esgotadas")
+    assert ledger.maker_fill_rate() == pytest.approx(9 / 13)     # postou e não entrou também conta
+    ledger.upsert(T0 - 600, status="skipped", reason="sem edge")
+    assert ledger.maker_fill_rate() == pytest.approx(9 / 13)     # janela que nem postou fica de fora
+    assert "maker: 9/13 (69%)" in calibration.render(tmp_path)
